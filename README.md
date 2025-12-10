@@ -41,9 +41,3 @@ pip install pandas numpy matplotlib scikit-learn tsfresh
 ## Outputs
 - Clustering results, daily metrics, feature tables, and forecast visualizations.
 - Data dictionary and preprocessing summary for reference.
-
-## License
-This project is proprietary and confidential to Infosys.
-
-## Contact
-For questions, contact the repository owner or project team.
