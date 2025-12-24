@@ -1,3 +1,18 @@
+"""
+src/feature_extract.py
+
+Module 2 - Feature Extraction & Modeling (complete, ready-to-run)
+
+Features:
+- Tries to use full cleaned dataframe from src/clean_merge.py if a helper exists.
+- Otherwise concatenates data/processed/train.csv + test.csv.
+- DEMO_MODE to run on recent subset (fast testing).
+- TSFresh optional (disabled by default, enable with RUN_TSFRESH=True).
+- Uses Prophet(mcmc_samples=0) for faster fitting.
+- Headless plotting (no GUI blocking). Saves PNGs & numeric CSVs.
+- Saves TFresh outputs and cluster CSVs if RUN_TSFRESH=True.
+"""
+
 import os
 import sys
 import warnings
@@ -17,6 +32,15 @@ import logging
 logging.getLogger("cmdstanpy").setLevel(logging.WARNING)
 logging.getLogger("prophet").setLevel(logging.WARNING)
 
+from prophet import Prophet
+
+from tsfresh import extract_features
+from tsfresh.utilities.dataframe_functions import impute
+
+
+from sklearn.cluster import KMeans, DBSCAN
+from sklearn.preprocessing import StandardScaler
+
 # -------------------------
 # User-tunable flags (edit here)
 # -------------------------
@@ -32,40 +56,6 @@ RUN_TASK3 = True
 
 PROPHET_MCMC_SAMPLES = 0  # 0 -> fast MAP optimization
 
-# -------------------------
-# Library checks
-# -------------------------
-_missing = []
-try:
-    from prophet import Prophet
-except Exception:
-    try:
-        from fbprophet import Prophet
-    except Exception:
-        Prophet = None
-        _missing.append("prophet")
-
-try:
-    from tsfresh import extract_features
-    from tsfresh.utilities.dataframe_functions import impute
-    TSFRESH_AVAILABLE = True
-except Exception:
-    TSFRESH_AVAILABLE = False
-    if RUN_TSFRESH:
-        _missing.append("tsfresh")
-
-try:
-    from sklearn.cluster import KMeans, DBSCAN
-    from sklearn.preprocessing import StandardScaler
-except Exception:
-    if RUN_TSFRESH:
-        _missing.append("scikit-learn")
-
-if _missing:
-    print("\nERROR: Missing packages:", ", ".join(_missing))
-    print("Install using (example):")
-    print(r'& "C:\Users\Mothiram Kosuri\AppData\Local\Programs\Python\Python311\python.exe" -m pip install ' + " ".join(_missing))
-    sys.exit(1)
 
 # -------------------------
 # Paths
@@ -360,9 +350,6 @@ def task3_steps(steps_df):
 # TSFresh + clustering (optional)
 # -------------------------
 def feature_extraction_and_clustering(daily_map):
-    if not TSFRESH_AVAILABLE:
-        print("\nTSFresh not available. Skipping.")
-        return None
     print("\n--- TSFresh feature extraction (may be slow) ---")
     def create_windows(daily_df, window=30):
         windows = []
