@@ -89,6 +89,7 @@ http://localhost:8501
 ### Tab 1: Home
 Interactive daily health summary:
 - Rotating motivational health messages
+- Compact 2-3 word health status tag with emoji derived from processed data
 - Today's metrics (Heart Rate, Steps, Sleep)
 - Daily anomaly summary
 - 7-day sparkline charts
@@ -105,7 +106,18 @@ Interactive health data exploration:
 - **Summary Statistics**: Mean, median, std dev, min, max, range
 
 ### Tab 3: Anomalies
-Advanced multi-method anomaly detection:
+Advanced multi-method anomaly detection supporting **both raw and processed CSV files**:
+
+#### Features:
+- **Smart Column Detection** 
+  - Auto-detects date columns: ds, timestamp, date, datetime, activityDate, logDate, sleepDate
+  - Auto-detects value columns: y, value, heart_rate, heartrate, steps, step_count, sleep_hours, duration, duration_minutes, hr, bpm, count
+  - Supports both processed files (ds, y format) and raw FitBit files
+- **Performance Optimization**
+  - Automatic sampling for large files (>10,000 rows) to prevent hanging
+  - Efficient vectorized anomaly detection
+  - Prophet caching to avoid recomputation
+  - Clustering limited to 5,000 samples for speed
 - **5 Detection Methods**:
   1. Statistical (±2.5σ threshold)
   2. Contextual (sudden spikes)
@@ -115,9 +127,61 @@ Advanced multi-method anomaly detection:
 - **Severity Classification**: Low/Medium/High
 - **Visualizations**:
   - Timeline scatter plot with color severity
-  - Anomaly frequency heatmap
+  - Anomaly frequency bar chart by date
   - Prophet forecast with anomalies
-- **Results Table**: Top 15 anomalies exportable to CSV
+  - Results table with export to CSV
+- **Data Formats Supported**:
+  - ✅ Processed CSV (ds, y columns)
+  - ✅ Raw FitBit Heart Rate (activityDate, value)
+  - ✅ Raw FitBit Steps (activityDate, steps)
+  - ✅ Raw FitBit Sleep (sleepDate, duration_minutes)
+  - ✅ Any CSV with date + value columns
+
+#### Known Issues Fixed (v2.1):
+| Issue | Cause | Solution |
+|-------|-------|----------|
+| Laptop hanging on large files | Loading full dataset at once | Auto-sampling to max 10,000 rows |
+| Missing date column error (sleep_raw) | Column name not recognized (sleepDate) | Enhanced pattern matching for raw files |
+| Heart rate raw not loading | activityDate column not detected | Added flexible column detection patterns |
+| Slow visualization with >50K rows | Prophet fitting on all data | Reduced sample size for clustering, caching |
+
+#### Optimization Details:
+```python
+# 1. Smart Column Detection (Multiple Patterns)
+date_patterns = ['ds', 'timestamp', 'date', 'time', 'datetime', 
+                 'activitydate', 'logdate', 'sleepdate']
+value_patterns = ['y', 'value', 'heart_rate', 'steps', 'sleep_hours', 
+                  'duration', 'duration_minutes', 'hr', 'bpm']
+
+# 2. Auto-Sampling for Performance
+if file_size > max_rows:  # default: 10,000
+    df = df.sample(n=max_rows, random_state=42).sort_values(date_col)
+
+# 3. Vectorized Anomaly Detection (Fast)
+anomaly_scores = np.zeros(len(df))
+outliers = (df['y'] < mean - 2.5*std) | (df['y'] > mean + 2.5*std)
+anomaly_scores[outliers] += 0.4  # vectorized assignment
+
+# 4. Prophet Caching (Avoid Recomputation)
+if metric_name not in st.session_state.get('prophet_cache', {}):
+    model = Prophet(...)  # fit once
+    forecast = model.predict(...)
+    st.session_state['prophet_cache'][metric_name] = forecast
+
+# 5. Clustering Optimization (Limited Sample)
+sample_size = min(len(df), 5000)  # max 5000 for clustering
+sample_indices = np.random.choice(len(df), sample_size, replace=False)
+km = KMeans(n_clusters=..., n_init=5)  # reduced from 10 for speed
+```
+
+#### How to Use with Raw Files:
+1. Upload raw FitBit CSV (or processed CSV)
+2. System auto-detects columns automatically
+3. Choose max rows setting for large files (default 10,000)
+4. Click "Analyze" → Results display instantly
+5. Download anomaly results as CSV
+
+✅ **Fast, smooth visualization even with large datasets!**
 
 ### Tab 4: Reports - Comprehensive Health Report Generator
 

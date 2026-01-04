@@ -1,10 +1,6 @@
-# -----------------------------
-# FitPlus Health Insights Dashboard
-# Streamlit Dashboard (Module 4)
-# -----------------------------
-
 import os
 import io
+import base64
 from datetime import datetime, timedelta, date
 import streamlit as st
 import pandas as pd
@@ -15,9 +11,6 @@ import matplotlib.pyplot as plt
 from fpdf import FPDF
 from prophet import Prophet
 
-# -----------------------------
-# STREAMLIT PAGE SETTINGS
-# -----------------------------
 st.set_page_config(
     page_title="FitPlus Health Insights Dashboard",
     page_icon="💪",
@@ -61,11 +54,327 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))   # src/
 PROJECT_ROOT = os.path.dirname(BASE_DIR)               # go up → project folder
 MODULE2_DIR = os.path.join(PROJECT_ROOT, "module2_outputs")
 
+# Path to processed data for holistic health status
+PROCESSED_DATA_PATH = os.path.join(
+    PROJECT_ROOT,
+    "data",
+    "processed",
+    "preprocessed_data.csv",
+)
+
+
+@st.cache_data(show_spinner=False)
+def load_processed_data(path: str):
+        """Load preprocessed data used to derive a simple daily health status."""
+        if not os.path.exists(path):
+                return None
+        try:
+                df = pd.read_csv(path)
+                if "timestamp" in df.columns:
+                        df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+                        df = df.dropna(subset=["timestamp"])
+                return df
+        except Exception:
+                return None
+
+def derive_daily_health_status(df):
+    """Return a short 2-3 word label and mood from the latest day.
+
+    Output: (status_label, mood_label)
+    mood_label in {"happy", "calm", "sleepy", "tired", "neutral"}
+    """
+    if df is None or df.empty or "timestamp" not in df.columns:
+        return "Status Unknown", "neutral"
+
+    work = df.copy()
+    work["date"] = work["timestamp"].dt.date
+    latest_date = work["date"].max()
+    if pd.isna(latest_date):
+        return "Status Unknown", "neutral"
+
+    day = work[work["date"] == latest_date]
+    if day.empty:
+        return "Status Unknown", "neutral"
+
+    avg_hr = day["heart_rate"].mean() if "heart_rate" in day.columns else None
+    total_steps = day["steps"].sum() if "steps" in day.columns else None
+    total_sleep = day["sleep_hours"].sum() if "sleep_hours" in day.columns else None
+
+    # If any core metric is missing, fall back to a generic label
+    if avg_hr is None or np.isnan(avg_hr) or total_steps is None or np.isnan(total_steps):
+        return "Syncing Data", "neutral"
+
+    # Basic rules of thumb combining movement, sleep, and heart rate
+    if (total_sleep is not None and not np.isnan(total_sleep) and total_sleep < 5.5) or avg_hr > 95:
+        return "Needs Rest", "tired"
+    if total_steps < 3000:
+        return "Low Activity", "sleepy"
+    if (
+        total_steps >= 10000
+        and total_sleep is not None
+        and not np.isnan(total_sleep)
+        and 7 <= total_sleep <= 9
+        and 55 <= avg_hr <= 85
+    ):
+        return "Great Balance", "happy"
+
+    return "On Track", "calm"
+
 files = {
     "Heart Rate": os.path.join(MODULE2_DIR, "daily_heart_rate.csv"),
     "Steps": os.path.join(MODULE2_DIR, "daily_steps.csv"),
     "Sleep": os.path.join(MODULE2_DIR, "daily_sleep.csv")
 }
+
+
+@st.cache_data(show_spinner=False)
+def load_steps_forecast_data():
+    """Load precomputed forecast data for steps with and without holidays.
+
+    Returns a dict with keys: actual, with_holidays, without_holidays, events.
+    Any missing piece will be set to None.
+    """
+    data = {"actual": None, "with_holidays": None, "without_holidays": None, "events": None}
+
+    # Actual daily steps
+    steps_path = os.path.join(MODULE2_DIR, "daily_steps.csv")
+    if os.path.exists(steps_path):
+        try:
+            df_steps = pd.read_csv(steps_path)
+            if "ds" in df_steps.columns and "y" in df_steps.columns:
+                df_steps["ds"] = pd.to_datetime(df_steps["ds"], errors="coerce")
+                df_steps = df_steps.dropna(subset=["ds"]).sort_values("ds")
+                data["actual"] = df_steps
+        except Exception:
+            pass
+
+    # Forecasts without holidays
+    no_holidays_path = os.path.join(MODULE2_DIR, "task3_forecast_no_holidays.csv")
+    if os.path.exists(no_holidays_path):
+        try:
+            df_no = pd.read_csv(no_holidays_path)
+            if "ds" in df_no.columns and "yhat" in df_no.columns:
+                df_no["ds"] = pd.to_datetime(df_no["ds"], errors="coerce")
+                df_no = df_no.dropna(subset=["ds"]).sort_values("ds")
+                data["without_holidays"] = df_no
+        except Exception:
+            pass
+
+    # Forecasts with holidays
+    with_holidays_path = os.path.join(MODULE2_DIR, "task3_forecast_with_holidays.csv")
+    if os.path.exists(with_holidays_path):
+        try:
+            df_with = pd.read_csv(with_holidays_path)
+            if "ds" in df_with.columns and "yhat" in df_with.columns:
+                df_with["ds"] = pd.to_datetime(df_with["ds"], errors="coerce")
+                df_with = df_with.dropna(subset=["ds"]).sort_values("ds")
+                data["with_holidays"] = df_with
+        except Exception:
+            pass
+
+    # Events impact (used to highlight holiday-related anomalies)
+    events_path = os.path.join(MODULE2_DIR, "task3_events_impact.csv")
+    if os.path.exists(events_path):
+        try:
+            df_events = pd.read_csv(events_path)
+            if "ds" in df_events.columns:
+                df_events["ds"] = pd.to_datetime(df_events["ds"], errors="coerce")
+                df_events = df_events.dropna(subset=["ds"]).sort_values("ds")
+                data["events"] = df_events
+        except Exception:
+            pass
+
+    return data
+
+
+def render_steps_forecast_section(start_date=None, end_date=None, show_anomalies=True, show_events=True):
+    """Render two graphs for steps: forecasts with and without holidays.
+
+    Uses precomputed module2_outputs forecasts and the daily_steps actuals.
+    If ``show_anomalies`` is False, the graphs will only show actuals,
+    forecasts and confidence bands (no red anomaly markers or event points).
+    """
+    data = load_steps_forecast_data()
+
+    steps_df = data.get("actual")
+    df_no = data.get("without_holidays")
+    df_with = data.get("with_holidays")
+    df_events = data.get("events")
+
+    if steps_df is None or df_no is None or df_with is None:
+        st.info("Steps forecast data (with/without holidays) is not available.")
+        return
+
+    # Optional date filtering
+    if start_date is not None and end_date is not None:
+        mask_actual = (steps_df["ds"].dt.date >= start_date) & (steps_df["ds"].dt.date <= end_date)
+        mask_no = (df_no["ds"].dt.date >= start_date) & (df_no["ds"].dt.date <= end_date)
+        mask_with = (df_with["ds"].dt.date >= start_date) & (df_with["ds"].dt.date <= end_date)
+        steps_df = steps_df.loc[mask_actual]
+        df_no = df_no.loc[mask_no]
+        df_with = df_with.loc[mask_with]
+
+        if steps_df.empty or df_no.empty or df_with.empty:
+            st.warning("No steps forecast data in the selected date range.")
+            return
+
+    # Merge actuals with forecasts (inner join on ds to keep aligned days)
+    merged_no = pd.merge(
+        steps_df[["ds", "y"]],
+        df_no[["ds", "yhat", "yhat_lower", "yhat_upper"]],
+        on="ds",
+        how="inner",
+    )
+    merged_with = pd.merge(
+        steps_df[["ds", "y"]],
+        df_with[["ds", "yhat", "yhat_lower", "yhat_upper"]],
+        on="ds",
+        how="inner",
+    )
+
+    if merged_no.empty or merged_with.empty:
+        st.warning("Aligned steps forecast data could not be prepared.")
+        return
+
+    # Identify anomalies based on forecast confidence intervals
+    merged_no["is_anom"] = (merged_no["y"] > merged_no["yhat_upper"]) | (merged_no["y"] < merged_no["yhat_lower"])
+    merged_with["is_anom"] = (merged_with["y"] > merged_with["yhat_upper"]) | (merged_with["y"] < merged_with["yhat_lower"])
+
+    col_a, col_b = st.columns(2)
+
+    # --- Without holidays ---
+    with col_a:
+        st.markdown("#### Steps Forecast (Without Holidays)")
+        fig_no = go.Figure()
+        fig_no.add_trace(
+            go.Scatter(
+                x=merged_no["ds"],
+                y=merged_no["y"],
+                mode="lines+markers",
+                name="Actual Steps",
+                line=dict(color="#2e86de", width=1.8),
+                marker=dict(size=4),
+            )
+        )
+        fig_no.add_trace(
+            go.Scatter(
+                x=merged_no["ds"],
+                y=merged_no["yhat"],
+                mode="lines",
+                name="Forecast (No Holidays)",
+                line=dict(color="#16a085", width=2, dash="dash"),
+            )
+        )
+        # Confidence band
+        fig_no.add_trace(
+            go.Scatter(
+                x=pd.concat([merged_no["ds"], merged_no["ds"][::-1]]),
+                y=pd.concat([merged_no["yhat_upper"], merged_no["yhat_lower"][::-1]]),
+                fill="toself",
+                fillcolor="rgba(46, 204, 113, 0.15)",
+                line=dict(color="rgba(0,0,0,0)"),
+                hoverinfo="skip",
+                showlegend=False,
+            )
+        )
+
+        # Anomaly markers (optional)
+        if show_anomalies:
+            anom_no = merged_no[merged_no["is_anom"]]
+            if not anom_no.empty:
+                fig_no.add_trace(
+                    go.Scatter(
+                        x=anom_no["ds"],
+                        y=anom_no["y"],
+                        mode="markers",
+                        name="Anomalies (No Holidays)",
+                        marker=dict(size=8, color="red", symbol="x"),
+                    )
+                )
+
+        fig_no.update_layout(
+            xaxis_title="Date",
+            yaxis_title="Steps",
+            height=320,
+            template="plotly_white",
+            hovermode="x unified",
+        )
+        st.plotly_chart(fig_no, use_container_width=True)
+
+    # --- With holidays ---
+    with col_b:
+        st.markdown("#### Steps Forecast (With Holidays)")
+        fig_with = go.Figure()
+        fig_with.add_trace(
+            go.Scatter(
+                x=merged_with["ds"],
+                y=merged_with["y"],
+                mode="lines+markers",
+                name="Actual Steps",
+                line=dict(color="#2e86de", width=1.8),
+                marker=dict(size=4),
+            )
+        )
+        fig_with.add_trace(
+            go.Scatter(
+                x=merged_with["ds"],
+                y=merged_with["yhat"],
+                mode="lines",
+                name="Forecast (With Holidays)",
+                line=dict(color="#8e44ad", width=2, dash="dash"),
+            )
+        )
+        # Confidence band
+        fig_with.add_trace(
+            go.Scatter(
+                x=pd.concat([merged_with["ds"], merged_with["ds"][::-1]]),
+                y=pd.concat([merged_with["yhat_upper"], merged_with["yhat_lower"][::-1]]),
+                fill="toself",
+                fillcolor="rgba(155, 89, 182, 0.15)",
+                line=dict(color="rgba(0,0,0,0)"),
+                hoverinfo="skip",
+                showlegend=False,
+            )
+        )
+
+        # Anomaly markers based on with-holiday forecast (optional)
+        if show_anomalies:
+            anom_with = merged_with[merged_with["is_anom"]]
+            if not anom_with.empty:
+                fig_with.add_trace(
+                    go.Scatter(
+                        x=anom_with["ds"],
+                        y=anom_with["y"],
+                        mode="markers",
+                        name="Anomalies (With Holidays)",
+                        marker=dict(size=8, color="red", symbol="x"),
+                    )
+                )
+
+        # Highlight specific holiday / event days if available (optional)
+        if show_events and df_events is not None and not df_events.empty:
+            events_merged = pd.merge(df_events[["ds", "event"]], merged_with[["ds", "yhat"]], on="ds", how="inner")
+            if not events_merged.empty:
+                fig_with.add_trace(
+                    go.Scatter(
+                        x=events_merged["ds"],
+                        y=events_merged["yhat"],
+                        mode="markers",
+                        name="Holiday / Event Days",
+                        marker=dict(size=9, color="orange", symbol="diamond"),
+                        text=events_merged["event"],
+                        hovertemplate="%{x|%Y-%m-%d}<br>Event: %{text}<br>Forecast: %{y:.0f} steps<extra></extra>",
+                    )
+                )
+
+        fig_with.update_layout(
+            xaxis_title="Date",
+            yaxis_title="Steps",
+            height=320,
+            template="plotly_white",
+            hovermode="x unified",
+        )
+        st.plotly_chart(fig_with, use_container_width=True)
 
 # -----------------------------
 # TABS
@@ -82,28 +391,68 @@ with tabs[0]:
         "Ready to crush your goals today?",
         "Stay strong, stay healthy!",
         "Your health journey continues!",
-        "Every step counts. Let's go!"
+        "Every step counts. Let's go!",
     ]
     import random
     greeting = random.choice(greetings)
-    st.markdown(f"<h2 style='font-size:2.5em; color:#2e86de; margin-bottom:0.2em;'>{greeting}</h2>", unsafe_allow_html=True)
+    st.markdown(
+        f"<h2 style='font-size:2.5em; color:#2e86de; margin-bottom:0.2em;'>{greeting}</h2>",
+        unsafe_allow_html=True,
+    )
+
+    # Derive a compact health status from processed data
+    processed_df = load_processed_data(PROCESSED_DATA_PATH)
+    health_status_label, health_mood = derive_daily_health_status(processed_df)
+
+    # Show status badge as a short 2-3 word summary with an emoji
+    status_container = st.container()
+    badge_colors = {
+        "happy": "#27ae60",
+        "calm": "#2980b9",
+        "sleepy": "#f1c40f",
+        "tired": "#e74c3c",
+        "neutral": "#7f8c8d",
+    }
+    mood_emojis = {
+        "happy": "😊",
+        "calm": "😌",
+        "sleepy": "😴",
+        "tired": "😓",
+        "neutral": "😐",
+    }
+    badge_color = badge_colors.get(health_mood, "#7f8c8d")
+    mood_emoji = mood_emojis.get(health_mood, "😐")
+    with status_container:
+        st.markdown(
+            f"""
+                        <div style="margin:0.25rem 0 0.75rem 0;">
+                            <span style="font-weight:600; color:#2c3e50; margin-right:0.35rem;">Health Status:</span>
+                            <span style="display:inline-flex; align-items:center; gap:0.3rem; padding:0.15rem 0.6rem; border-radius:999px; background:{badge_color}; color:white; font-weight:600; font-size:0.9rem;">
+                                <span>{mood_emoji}</span>
+                                <span>{health_status_label}</span>
+                            </span>
+                        </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
     # Load today's stats
     today = pd.Timestamp.now().normalize()
+
     def get_today_stat(path, value_col):
         if os.path.exists(path):
             df = pd.read_csv(path)
-            if 'ds' in df.columns:
-                df['ds'] = pd.to_datetime(df['ds'])
+            if "ds" in df.columns:
+                df["ds"] = pd.to_datetime(df["ds"])
                 # Find rows where ds is today (any time)
-                row = df[df['ds'].dt.normalize() == today]
+                row = df[df["ds"].dt.normalize() == today]
                 if not row.empty:
                     return row.iloc[0][value_col]
         return None
 
-    hr = get_today_stat(files["Heart Rate"], 'y')
-    steps = get_today_stat(files["Steps"], 'y')
-    sleep = get_today_stat(files["Sleep"], 'y')
+    hr = get_today_stat(files["Heart Rate"], "y")
+    steps = get_today_stat(files["Steps"], "y")
+    sleep = get_today_stat(files["Sleep"], "y")
 
     col1, col2, col3 = st.columns(3)
     col1.metric("Today's Avg Heart Rate", f"{hr:.0f} bpm" if hr else "-", delta=None)
@@ -116,9 +465,9 @@ with tabs[0]:
     anomaly_path = os.path.join(MODULE2_DIR, "task3_events_impact.csv")
     if os.path.exists(anomaly_path):
         adf = pd.read_csv(anomaly_path)
-        if 'date' in adf.columns:
-            adf['date'] = pd.to_datetime(adf['date']).dt.normalize()
-            today_anoms = adf[adf['date'] == today]
+        if "date" in adf.columns:
+            adf["date"] = pd.to_datetime(adf["date"]).dt.normalize()
+            today_anoms = adf[adf["date"] == today]
             if not today_anoms.empty:
                 anomaly_summary = f"{len(today_anoms)} anomaly(s) detected today."
     st.info(anomaly_summary)
@@ -126,14 +475,29 @@ with tabs[0]:
     # 7-day sparklines
     st.markdown("#### Last 7 Days Overview")
     spark_col1, spark_col2, spark_col3 = st.columns(3)
+
     def sparkline(path, label, col):
         if os.path.exists(path):
             df = pd.read_csv(path)
-            if 'ds' in df.columns:
-                df['ds'] = pd.to_datetime(df['ds'])
-                last7 = df.sort_values('ds').tail(7)
+            if "ds" in df.columns:
+                df["ds"] = pd.to_datetime(df["ds"])
+                df["date"] = df["ds"].dt.normalize()
+                # Build a fixed 7-day window ending today
+                end_date = today
+                start_date = today - pd.Timedelta(days=6)
+                date_index = pd.date_range(start_date, end_date, freq="D")
+
+                # Aggregate to one value per day (last value if multiple)
+                daily = (
+                    df.sort_values("date")
+                      .drop_duplicates(subset="date", keep="last")
+                      .set_index("date")["y"]
+                )
+                series = daily.reindex(date_index, fill_value=0)
+
                 col.markdown(f"**{label}**")
-                col.line_chart(last7['y'].reset_index(drop=True), height=60)
+                col.line_chart(series, height=60)
+
     sparkline(files["Heart Rate"], "Heart Rate", spark_col1)
     sparkline(files["Steps"], "Steps", spark_col2)
     sparkline(files["Sleep"], "Sleep", spark_col3)
@@ -218,6 +582,16 @@ with tabs[1]:
                     
                     df['ds'] = pd.to_datetime(df['ds'])
                     df = df.sort_values('ds')
+
+                    # Choose a friendly y-axis label based on metric type
+                    if metric == "Heart Rate":
+                        y_label = "Heart Rate (bpm)"
+                    elif metric == "Steps":
+                        y_label = "Steps"
+                    elif metric == "Sleep":
+                        y_label = "Minutes Asleep"
+                    else:
+                        y_label = "Value"
                     
                     # Filter by date range
                     df_range = df[(df['ds'].dt.date >= start_date) & (df['ds'].dt.date <= end_date)].copy()
@@ -242,7 +616,7 @@ with tabs[1]:
                         fig_ts.update_layout(
                             title="Time Series",
                             xaxis_title="Date",
-                            yaxis_title="Value",
+                            yaxis_title=y_label,
                             height=400,
                             hovermode='x unified',
                             template='plotly_white'
@@ -261,7 +635,7 @@ with tabs[1]:
                         fig_scatter.update_layout(
                             title="Scatter Plot",
                             xaxis_title="Date",
-                            yaxis_title="Value",
+                            yaxis_title=y_label,
                             height=400,
                             hovermode='closest',
                             template='plotly_white'
@@ -295,7 +669,7 @@ with tabs[1]:
                                 fig_trend.update_layout(
                                     title="Trend Component",
                                     xaxis_title="Date",
-                                    yaxis_title="Value",
+                                    yaxis_title=y_label,
                                     height=400,
                                     hovermode='x unified',
                                     template='plotly_white'
@@ -322,7 +696,7 @@ with tabs[1]:
                                     fig_weekly.update_layout(
                                         title="Weekly Seasonality",
                                         xaxis_title="Date",
-                                        yaxis_title="Component",
+                                        yaxis_title="Seasonality Component",
                                         height=350,
                                         template='plotly_white'
                                     )
@@ -339,7 +713,7 @@ with tabs[1]:
                                     fig_yearly.update_layout(
                                         title="Yearly Seasonality",
                                         xaxis_title="Date",
-                                        yaxis_title="Component",
+                                        yaxis_title="Seasonality Component",
                                         height=350,
                                         template='plotly_white'
                                     )
@@ -347,6 +721,17 @@ with tabs[1]:
                         except Exception as e:
                             st.warning(f"Seasonality visualization error: {str(e)}")
                     
+                    # Additional forecast comparison specifically for Steps
+                    if metric == "Steps":
+                        st.markdown("### 📈 Steps Forecast: With vs Without Holidays")
+                        # In Analysis we show clean forecasts (no anomaly markers)
+                        render_steps_forecast_section(
+                            start_date=start_date,
+                            end_date=end_date,
+                            show_anomalies=False,
+                            show_events=False,
+                        )
+
                     # Summary Statistics Table
                     st.markdown("### 📊 Summary Statistics")
                     
@@ -373,17 +758,89 @@ with tabs[1]:
 with tabs[2]:
     st.subheader("🔍 Advanced Anomaly Detection")
     
+    # ===== ADVANCED COLUMN DETECTION FUNCTION =====
+    def smart_detect_columns(df):
+        """Smart column detection for both raw and processed files."""
+        df.columns = df.columns.str.lower().str.strip()
+        
+        # Detect DATE column (enhanced for raw files including sleep)
+        date_col = None
+        date_patterns = ['ds', 'timestamp', 'date', 'datetime', 'activitydate', 'logdate', 'sleepdate', 'time', 'starttime', 'endtime', 'startdate', 'enddate']
+        for col in df.columns:
+            col_lower = col.lower()
+            for pattern in date_patterns:
+                if col_lower == pattern or col_lower.endswith(pattern):
+                    date_col = col
+                    break
+            if date_col:
+                break
+        
+        # Detect VALUE column (enhanced for raw files including sleep)
+        value_col = None
+        # Order matters - check specific patterns first
+        value_patterns = ['y', 'value', 'steps', 'step_count', 'heart_rate', 'heartrate', 'duration', 'duration_minutes', 'metric', 'val', 'sleep_hours', 'hr', 'bpm', 'count', 'minutesasleep', 'minutes_asleep']
+        
+        for pattern in value_patterns:
+            for col in df.columns:
+                col_lower = col.lower()
+                if col_lower == pattern:  # Exact match first
+                    value_col = col
+                    break
+            if value_col:
+                break
+        
+        # If no exact match, try partial matching
+        if not value_col:
+            for col in df.columns:
+                col_lower = col.lower()
+                for pattern in value_patterns:
+                    if pattern in col_lower and col_lower != 'timestamp' and col_lower != 'date' and 'date' not in col_lower and 'time' not in col_lower:
+                        value_col = col
+                        break
+                if value_col:
+                    break
+        
+        return date_col, value_col
+    
     # ===== FILE UPLOAD & CONFIG (MINIMAL) =====
     col1, col2 = st.columns([2, 1])
     
     with col1:
-        uploaded_files = st.file_uploader("📁 Upload CSV Files (up to 5)", type=["csv"], accept_multiple_files=True, key="anom_upload")
+        st.markdown("**📁 Upload CSV Files (Raw or Processed)**")
+        uploaded_files = st.file_uploader("Choose CSV files (up to 5)", type=["csv"], accept_multiple_files=True, key="anom_upload")
     
     with col2:
-        st.markdown("**Severity Thresholds**")
-        low_threshold = st.slider("Low", 0.0, 1.0, 0.3, step=0.05, key="low_sev_global")
-        medium_threshold = st.slider("Medium", low_threshold, 1.0, 0.7, step=0.05, key="med_sev_global")
-        high_threshold = st.slider("High", medium_threshold, 1.0, 0.85, step=0.05, key="high_sev_global")
+        st.markdown("**⚙️ Severity Levels**")
+        low_threshold = st.slider(
+            "Low",
+            0.0,
+            1.0,
+            0.3,
+            step=0.05,
+            key="low_sev_global",
+            help="Use this to control how many points are flagged as unusual. Slide left to see more, right to see only bigger changes.",
+        )
+        medium_threshold = st.slider(
+            "Medium",
+            low_threshold,
+            1.0,
+            0.7,
+            step=0.05,
+            key="med_sev_global",
+            help="Use this to separate minor anomalies from ones you usually want to review.",
+        )
+        high_threshold = st.slider(
+            "High",
+            medium_threshold,
+            1.0,
+            0.85,
+            step=0.05,
+            key="high_sev_global",
+            help="Use this to decide which anomalies you treat as urgent and act on first.",
+        )
+    
+    # Internal settings (not visible to user)
+    max_rows = 10000
     
     if uploaded_files:
         if len(uploaded_files) > 5:
@@ -397,48 +854,66 @@ with tabs[2]:
                     processed_data = {}
                     
                     for idx, file in enumerate(uploaded_files):
-                        df = pd.read_csv(file)
-                        df.columns = df.columns.str.lower().str.strip()
+                        progress_text = f"Processing {file.name}..."
+                        st.info(progress_text)
                         
-                        # Find date column
-                        date_col = None
-                        for col_name in ['ds', 'timestamp', 'date', 'time', 'datetime']:
-                            if col_name in df.columns:
-                                date_col = col_name
-                                break
+                        # Read CSV with optimization
+                        df = pd.read_csv(file, low_memory=False)
+                        file_size = len(df)
+                        
+                        # Sample if too large (for performance)
+                        if file_size > max_rows:
+                            st.warning(f"⚠️ {file.name}: {file_size:,} rows. Sampling {max_rows:,} for analysis")
+                            df = df.sample(n=max_rows, random_state=42).sort_values(df.columns[0])
+                        
+                        # Smart column detection
+                        date_col, value_col = smart_detect_columns(df)
+                        
                         if date_col is None:
-                            st.error(f"❌ {file.name}: Missing date column (expected: ds, timestamp, date)")
+                            st.error(f"❌ {file.name}: Could not find date column. Columns: {', '.join(df.columns[:5])}")
                             continue
                         
-                        # Find value column
-                        value_col = None
-                        for col_name in ['y', 'value', 'metric', 'val', 'data', 'heart_rate', 'steps', 'sleep_hours', 'hr']:
-                            if col_name in df.columns:
-                                value_col = col_name
-                                break
                         if value_col is None:
-                            st.error(f"❌ {file.name}: Missing value column (expected: y, value, heart_rate, steps, sleep_hours)")
+                            st.error(f"❌ {file.name}: Could not find value column. Columns: {', '.join(df.columns[:5])}")
                             continue
                         
-                        # Clean data
+                        # Clean data with optimization
                         df_clean = pd.DataFrame()
-                        df_clean['ds'] = pd.to_datetime(df[date_col], errors='coerce')
-                        df_clean['y'] = pd.to_numeric(df[value_col], errors='coerce')
                         
-                        if df_clean['ds'].isna().all() or df_clean['y'].isna().all():
-                            st.error(f"❌ {file.name}: Invalid data")
+                        # Parse dates efficiently
+                        try:
+                            df_clean['ds'] = pd.to_datetime(df[date_col], errors='coerce')
+                        except:
+                            st.error(f"❌ {file.name}: Could not parse date column '{date_col}'")
                             continue
                         
-                        df_clean['y'] = df_clean['y'].fillna(df_clean['y'].mean())
-                        df_clean = df_clean.dropna(subset=['ds']).sort_values('ds').reset_index(drop=True)
+                        # Parse values
+                        try:
+                            df_clean['y'] = pd.to_numeric(df[value_col], errors='coerce')
+                        except:
+                            st.error(f"❌ {file.name}: Could not parse value column '{value_col}'")
+                            continue
+                        
+                        # Remove completely invalid rows
+                        df_clean = df_clean.dropna(subset=['ds', 'y'])
+                        
+                        if len(df_clean) == 0:
+                            st.error(f"❌ {file.name}: No valid data after cleaning")
+                            continue
+                        
+                        # Fill remaining NaN values efficiently
+                        df_clean['y'] = df_clean['y'].fillna(df_clean['y'].median())
+                        
+                        # Sort and reset
+                        df_clean = df_clean.sort_values('ds').reset_index(drop=True)
                         
                         if len(df_clean) < 5:
-                            st.error(f"❌ {file.name}: Need at least 5 points")
+                            st.error(f"❌ {file.name}: Need at least 5 valid data points (found {len(df_clean)})")
                             continue
                         
-                        # Determine metric
+                        # Determine metric type from filename
                         fname = file.name.lower()
-                        if 'heart' in fname or 'hr' in fname:
+                        if 'heart' in fname or 'hr' in fname or 'heartrate' in fname:
                             metric_type = 'Heart Rate'
                         elif 'step' in fname:
                             metric_type = 'Steps'
@@ -448,6 +923,7 @@ with tabs[2]:
                             metric_type = f'Metric_{idx}'
                         
                         processed_data[metric_type] = df_clean
+                        st.success(f"✅ {file.name} → {metric_type} ({len(df_clean)} records)")
                     
                     if processed_data:
                         st.session_state['anom_data'] = processed_data
@@ -460,33 +936,49 @@ with tabs[2]:
                         st.rerun()
                     
                 except Exception as e:
-                    st.error(f"Error: {str(e)[:100]}")
+                    st.error(f"Error: {str(e)[:150]}")
         
-        # ===== DISPLAY CACHED RESULTS =====
+        # ===== DISPLAY CACHED RESULTS (OPTIMIZED) =====
         if 'anom_data' in st.session_state:
             config = st.session_state['anom_config']
             
             for metric_name, df in st.session_state['anom_data'].items():
                 df = df.copy()
+                
+                # Handle edge cases
+                if len(df) < 3 or df['y'].std() == 0:
+                    st.warning(f"⚠️ {metric_name}: Insufficient variance for analysis")
+                    continue
+                
                 mean_val = df['y'].mean()
                 std_val = df['y'].std()
+
+                # Friendly label for the value axis based on metric
+                if "heart" in metric_name.lower():
+                    value_label = "Heart Rate (bpm)"
+                elif "step" in metric_name.lower():
+                    value_label = "Steps"
+                elif "sleep" in metric_name.lower():
+                    value_label = "Minutes Asleep"
+                else:
+                    value_label = "Value"
                 
                 # FAST: Vectorized anomaly detection
                 anomaly_scores = np.zeros(len(df))
                 anomaly_types = np.array(['Normal'] * len(df))
                 
-                # Point anomalies
+                # Point anomalies (fast, vectorized)
                 outliers = (df['y'] < mean_val - 2.5 * std_val) | (df['y'] > mean_val + 2.5 * std_val)
                 anomaly_scores[outliers] += 0.4
                 anomaly_types[outliers] = 'Point'
                 
-                # Contextual anomalies
+                # Contextual anomalies (fast, vectorized)
                 changes = np.abs(df['y'].diff()).fillna(0)
                 spikes = changes > std_val * 2
                 anomaly_scores[spikes] += 0.3
                 anomaly_types[spikes] = 'Contextual'
                 
-                # Prophet (once, cached via session)
+                # Prophet (once, cached via session) - OPTIMIZED for large data
                 if len(df) >= 20 and 'prophet_cache' not in st.session_state:
                     st.session_state['prophet_cache'] = {}
                 
@@ -494,8 +986,18 @@ with tabs[2]:
                     try:
                         df_p = df[['ds', 'y']].copy()
                         df_p.columns = ['ds', 'y']
-                        model = Prophet(interval_width=0.95, yearly_seasonality=True, weekly_seasonality=True, daily_seasonality=False)
-                        model.fit(df_p)
+                        
+                        # Suppress Prophet warnings
+                        import logging
+                        logging.getLogger('prophet').setLevel(logging.WARNING)
+                        
+                        model = Prophet(interval_width=0.95, yearly_seasonality=len(df)>365, 
+                                      weekly_seasonality=True, daily_seasonality=False)
+                        
+                        # Fit with reduced verbosity
+                        with st.spinner(f"Fitting Prophet for {metric_name}..."):
+                            model.fit(df_p)
+                        
                         forecast = model.predict(df_p[['ds']])
                         st.session_state['prophet_cache'][metric_name] = forecast
                         
@@ -508,13 +1010,20 @@ with tabs[2]:
                     model_anom = (df['y'].values < forecast['yhat_lower'].values) | (df['y'].values > forecast['yhat_upper'].values)
                     anomaly_scores[model_anom] += 0.4
                 
-                # Cluster-based
+                # Cluster-based (OPTIMIZED for large data)
                 try:
                     from sklearn.cluster import KMeans, DBSCAN
                     X = np.column_stack([(df['y'] - mean_val) / (std_val + 1e-6), np.arange(len(df)) / len(df)])
                     
-                    km = KMeans(n_clusters=min(4, len(df) // 2), random_state=42, n_init=10)
-                    labels = km.fit_predict(X)
+                    # Limit clustering to first 5000 points for performance
+                    sample_size = min(len(df), 5000)
+                    sample_indices = np.random.choice(len(df), sample_size, replace=False)
+                    X_sample = X[sample_indices]
+                    
+                    km = KMeans(n_clusters=min(4, len(df) // 2), random_state=42, n_init=5)
+                    labels_sample = km.fit_predict(X_sample)
+                    labels = km.predict(X)
+                    
                     _, counts = np.unique(labels, return_counts=True)
                     small = np.unique(labels)[counts < len(df) * 0.05]
                     kmeans_anom = np.isin(labels, small)
@@ -540,19 +1049,127 @@ with tabs[2]:
                 df['severity'] = severity
                 df['is_anom'] = anomaly_scores >= config['low_threshold']
                 
-                # DISPLAY
+                # DISPLAY (OPTIMIZED - fewer but informative charts)
                 st.markdown(f"---\n## {metric_name}")
-                
+
                 n_anom = df['is_anom'].sum()
                 n_high = (df['severity'] == 'High').sum()
                 n_med = (df['severity'] == 'Medium').sum()
                 n_low = (df['severity'] == 'Low').sum()
-                
+
                 col1, col2, col3, col4 = st.columns(4)
-                col1.metric("Total", n_anom)
+                col1.metric("Total Anomalies", n_anom)
                 col2.metric("🔴 High", n_high)
                 col3.metric("🟠 Medium", n_med)
                 col4.metric("🟡 Low", n_low)
+
+                # Compact summary flashcard for this metric type
+                if n_anom > 0:
+                    if "heart" in metric_name.lower():
+                        reason_text = (
+                            "Heart rate anomalies can come from intense exercise, stress, "
+                            "caffeine, or possible cardiovascular issues when they repeat."
+                        )
+                    elif "step" in metric_name.lower():
+                        reason_text = (
+                            "Step anomalies usually reflect very active days, sick/rest days, "
+                            "travel, or major routine changes."
+                        )
+                    elif "sleep" in metric_name.lower():
+                        reason_text = (
+                            "Sleep anomalies are often caused by stress, late work, travel, "
+                            "illness, or changes in sleep schedule."
+                        )
+                    else:
+                        reason_text = (
+                            "Anomalies indicate values that behave very differently from your "
+                            "usual pattern and should be checked against your recent activities."
+                        )
+
+                    # Build richer summary content depending on metric type
+                    extra_lines = []
+
+                    # Steps: highlight highest / lowest step days in recent week window
+                    if "step" in metric_name.lower():
+                        try:
+                            temp = df.copy()
+                            temp["date"] = temp["ds"].dt.normalize()
+                            daily_steps = temp.groupby("date")["y"].sum().sort_index()
+                            if len(daily_steps) > 0:
+                                window = daily_steps.tail(7) if len(daily_steps) >= 7 else daily_steps
+                                max_date = window.idxmax()
+                                min_date = window.idxmin()
+                                max_val = window.max()
+                                min_val = window.min()
+                                extra_lines.append(
+                                    f"Steps weekly pattern (last {len(window)} days):"
+                                )
+                                extra_lines.append(
+                                    f"- Highest steps on {max_date.strftime('%A')} ({max_val:,.0f} steps)."
+                                )
+                                extra_lines.append(
+                                    f"- Lowest steps on {min_date.strftime('%A')} ({min_val:,.0f} steps)."
+                                )
+                        except Exception:
+                            pass
+
+                    # Sleep: which weekday has most / least average sleep and trend
+                    if "sleep" in metric_name.lower():
+                        try:
+                            temp = df.copy()
+                            temp["date"] = temp["ds"].dt.normalize()
+                            daily_sleep = temp.groupby("date")["y"].sum().sort_index()
+                            if len(daily_sleep) > 0:
+                                # Average duration by weekday name
+                                sleep_df = daily_sleep.to_frame("duration")
+                                sleep_df["weekday"] = sleep_df.index.day_name()
+                                by_weekday = sleep_df.groupby("weekday")["duration"].mean()
+                                if not by_weekday.empty:
+                                    max_wd = by_weekday.idxmax()
+                                    min_wd = by_weekday.idxmin()
+                                    max_val = by_weekday.max()
+                                    min_val = by_weekday.min()
+
+                                    # Convert minutes to hours when values look like minutes
+                                    max_hours = max_val / 60.0
+                                    min_hours = min_val / 60.0
+
+                                    extra_lines.append("Sleep weekday pattern (average):")
+                                    extra_lines.append(
+                                        f"- Most sleep on {max_wd} (~{max_hours:.1f} hours)."
+                                    )
+                                    extra_lines.append(
+                                        f"- Least sleep on {min_wd} (~{min_hours:.1f} hours)."
+                                    )
+
+                                # Simple trend: compare last 7 vs previous 7 days
+                                if len(daily_sleep) >= 14:
+                                    last7 = daily_sleep.tail(7).mean()
+                                    prev7 = daily_sleep.tail(14).head(7).mean()
+                                    diff = last7 - prev7
+                                    if abs(diff) < 0.1:
+                                        trend_text = "Sleep duration is relatively stable over recent weeks."
+                                    elif diff > 0:
+                                        trend_text = "Sleep duration is increasing in the most recent week."
+                                    else:
+                                        trend_text = "Sleep duration is decreasing in the most recent week."
+                                    extra_lines.append(trend_text)
+                        except Exception:
+                            pass
+
+                    # Use Streamlit's default blue info box style
+                    # Show severity breakdown, then reasons, then any extra insights
+                    summary_lines = [
+                        f"Summary: {n_anom} anomalies detected:",
+                        f"- High: {n_high}",
+                        f"- Medium: {n_med}",
+                        f"- Low: {n_low}",
+                        "",
+                        f"Possible reasons: {reason_text}",
+                    ]
+
+                    text = "\n".join(summary_lines + extra_lines)
+                    st.info(text)
                 
                 # TWO GRAPHS ONLY (FAST)
                 col_left, col_right = st.columns(2)
@@ -574,7 +1191,15 @@ with tabs[2]:
                     q_upper = df['y'].quantile(0.9)
                     fig.add_hline(y=q_lower, line_dash="dash", line_color="green", opacity=0.4)
                     fig.add_hline(y=q_upper, line_dash="dash", line_color="red", opacity=0.4)
-                    fig.update_layout(height=280, template='plotly_white', margin=dict(l=30, r=30, t=20, b=20), hovermode='closest')
+                    fig.update_layout(
+                        title="Anomalies Timeline",
+                        xaxis_title="Date",
+                        yaxis_title=value_label,
+                        height=280,
+                        template='plotly_white',
+                        margin=dict(l=30, r=30, t=20, b=20),
+                        hovermode='closest',
+                    )
                     st.plotly_chart(fig, use_container_width=True)
                 
                 # Density
@@ -600,10 +1225,23 @@ with tabs[2]:
                         anom = df[df['is_anom']]
                         if len(anom) > 0:
                             fig.add_trace(go.Scatter(x=anom['ds'], y=anom['y'], mode='markers', name='Flagged', marker=dict(size=5, color='red', symbol='x')))
-                        fig.update_layout(height=280, template='plotly_white', margin=dict(l=30, r=30, t=20, b=20))
+                        fig.update_layout(
+                            title="Forecast with Anomaly Bands",
+                            xaxis_title="Date",
+                            yaxis_title=value_label,
+                            height=280,
+                            template='plotly_white',
+                            margin=dict(l=30, r=30, t=20, b=20),
+                        )
                         st.plotly_chart(fig, use_container_width=True)
                     except:
                         pass
+
+                # For steps data, always show precomputed forecasts with and without holidays
+                if "step" in metric_name.lower():
+                    st.markdown("#### 📈 Steps Forecast: With vs Without Holidays")
+                    # Use full available range from module outputs (independent of upload window)
+                    render_steps_forecast_section(show_anomalies=True, show_events=True)
                 
                 # Results Table
                 if n_anom > 0:
@@ -687,61 +1325,6 @@ with tabs[3]:
                 if st.button("Generate Report", use_container_width=True, key="gen_comprehensive_report"):
                     with st.spinner("Generating comprehensive report..."):
                         try:
-                            # Create visualizations
-                            fig_analysis = go.Figure()
-                            fig_analysis.add_trace(go.Scatter(
-                                x=df['date'], y=df['value'],
-                                mode='lines+markers',
-                                name=metric_type,
-                                line=dict(color='#2e86de', width=2),
-                                marker=dict(size=4)
-                            ))
-                            fig_analysis.add_hline(y=mean_val, line_dash="dash", line_color="green", annotation_text="Mean")
-                            
-                            # Mark anomalies
-                            if len(anomaly_indices) > 0:
-                                anom_dates = df['date'].iloc[anomaly_indices]
-                                anom_vals = df['value'].iloc[anomaly_indices]
-                                fig_analysis.add_trace(go.Scatter(
-                                    x=anom_dates, y=anom_vals,
-                                    mode='markers',
-                                    name='Anomalies',
-                                    marker=dict(size=10, color='red', symbol='x')
-                                ))
-                            
-                            fig_analysis.update_layout(
-                                title=f"{metric_type} Analysis",
-                                xaxis_title="Date",
-                                yaxis_title=f"Value ({unit})",
-                                height=400,
-                                template='plotly_white'
-                            )
-                            
-                            # Convert to image
-                            img_analysis = io.BytesIO()
-                            fig_analysis.write_image(img_analysis, format="png", width=700, height=400)
-                            img_analysis.seek(0)
-                            
-                            # Distribution plot
-                            fig_dist = go.Figure()
-                            fig_dist.add_trace(go.Histogram(
-                                x=df['value'],
-                                nbinsx=30,
-                                marker=dict(color='#ff6348'),
-                                name=metric_type
-                            ))
-                            fig_dist.update_layout(
-                                title="Value Distribution",
-                                xaxis_title=f"Value ({unit})",
-                                yaxis_title="Frequency",
-                                height=400,
-                                template='plotly_white'
-                            )
-                            
-                            img_dist = io.BytesIO()
-                            fig_dist.write_image(img_dist, format="png", width=700, height=400)
-                            img_dist.seek(0)
-                            
                             # Generate comprehensive report text
                             report_text = f"""
 FitPlus Health Report - {metric_type}
@@ -968,19 +1551,22 @@ Please consult with a qualified healthcare provider for medical concerns.
 Generated by: FitPlus Health Insights Dashboard
 Report Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 """
-                            
+
                             # Create PDF with embedded graphs
                             pdf = FPDF()
+                            pdf.set_auto_page_break(auto=True, margin=15)
+                            pdf.set_left_margin(20)
+                            pdf.set_right_margin(20)
                             pdf.add_page()
                             pdf.set_font("Arial", size=10)
-                            
+                            text_width = pdf.w - pdf.l_margin - pdf.r_margin
+
                             # Comprehensive character sanitization function for FPDF compatibility
                             def sanitize_for_pdf(text):
                                 """Remove all non-ASCII characters and Unicode symbols, replace with safe ASCII equivalents."""
                                 if not isinstance(text, str):
                                     text = str(text)
-                                
-                                # Unicode to ASCII replacements (comprehensive)
+
                                 replacements = {
                                     'σ': 'std_dev', 'Σ': 'SIGMA', 'μ': 'mean',
                                     '↑': '[UP]', '↓': '[DOWN]', '→': '[RIGHT]', '←': '[LEFT]',
@@ -1003,78 +1589,60 @@ Report Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
                                     '‵': "'", '‶': '"',
                                     'ʹ': "'", 'ʺ': '"', 'ʻ': "'", 'ʼ': "'", 'ʽ': "'", 'ʾ': "'", 'ʿ': "'",
                                 }
-                                
-                                # Apply direct replacements
+
                                 result = text
                                 for unicode_char, replacement in replacements.items():
                                     result = result.replace(unicode_char, replacement)
-                                
-                                # Remove any remaining non-ASCII characters beyond 127
+
                                 try:
                                     result = result.encode('ascii', 'ignore').decode('ascii')
-                                except:
+                                except Exception:
                                     result = ''.join(char if ord(char) < 128 else '?' for char in result)
-                                
+
                                 return result
-                            
+
                             # Add text to PDF with proper encoding and width handling
                             for line in report_text.split('\n'):
                                 if line.strip():
-                                    # Sanitize line for FPDF (remove all non-ASCII characters)
                                     clean_line = sanitize_for_pdf(line)
-                                    # Use multi_cell with proper width (185 = full page with margins)
                                     if clean_line.strip():
-                                        pdf.multi_cell(185, 5, clean_line, align='L')
+                                        pdf.multi_cell(text_width, 5, clean_line, align='L')
                                 else:
                                     pdf.ln(2)
-                            
-                            # Add page break and graphs
-                            pdf.add_page()
-                            pdf.set_font("Arial", size=14, style="B")
-                            pdf.cell(0, 10, "Data Visualizations", ln=True)
-                            pdf.ln(5)
-                            
-                            # Add analysis graph
-                            pdf.image(img_analysis, x=10, w=190)
-                            pdf.ln(2)
-                            pdf.set_font("Arial", size=10)
-                            pdf.multi_cell(0, 4, "Analysis Graph: Time-series visualization of your health metrics with identified anomalies marked in red.")
-                            
-                            pdf.ln(5)
-                            
-                            # Add distribution graph
-                            pdf.image(img_dist, x=10, w=190)
-                            pdf.ln(2)
-                            pdf.multi_cell(0, 4, "Distribution Graph: Frequency distribution showing how your values are spread across the range.")
-                            
-                            # Save PDF
+
+                            # Save PDF to disk
                             pdf_filename = f"HealthReport_{metric_type.replace(' ', '')}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
                             pdf.output(pdf_filename)
-                            
-                            # Display success and download button
-                            st.success(f"✓ Report generated successfully!")
-                            st.markdown("---")
-                            
+
+                            # Read PDF bytes once
                             with open(pdf_filename, "rb") as f:
-                                st.download_button(
-                                    "📥 Download PDF Report",
-                                    f,
-                                    file_name=pdf_filename,
-                                    mime="application/pdf",
-                                    use_container_width=True
-                                )
-                            
-                            # Show preview
+                                pdf_bytes = f.read()
+
+                            # Display success and download button
+                            st.success("✓ Report generated successfully!")
+                            st.markdown("---")
+
+                            st.download_button(
+                                "📥 Download PDF Report",
+                                data=pdf_bytes,
+                                file_name=pdf_filename,
+                                mime="application/pdf",
+                                use_container_width=True,
+                            )
+
+                            # Inline PDF preview (centered, like a printed page)
                             st.markdown("### Report Preview")
-                            st.text(report_text)
-                            
-                            # Display graphs
-                            st.markdown("### Visualizations")
-                            col1, col2 = st.columns(2)
-                            with col1:
-                                st.plotly_chart(fig_analysis, use_container_width=True)
-                            with col2:
-                                st.plotly_chart(fig_dist, use_container_width=True)
+                            base64_pdf = base64.b64encode(pdf_bytes).decode("utf-8")
+                            pdf_display = f'''
+                            <div style="display:flex; justify-content:center;">
+                              <iframe
+                                src="data:application/pdf;base64,{base64_pdf}"
+                                style="width:100%; max-width:900px; height:800px; border:1px solid #ccc; box-shadow:0 0 8px rgba(0,0,0,0.1);"
+                                type="application/pdf">
+                              </iframe>
+                            </div>
+                            '''
+                            st.markdown(pdf_display, unsafe_allow_html=True)
                         
                         except Exception as e:
                             st.error(f"Error generating report: {str(e)}")
@@ -1088,3 +1656,4 @@ Report Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
         
         except Exception as e:
             st.error(f"Error processing file: {str(e)}")
+                

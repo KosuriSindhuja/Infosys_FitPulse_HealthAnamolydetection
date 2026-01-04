@@ -1,46 +1,3 @@
-"""
-visualize_anomaly.py
-
-MILESTONE 3: Advanced Anomaly Detection & Visualization
-Enhanced to support multi-method ensemble-based anomaly detection.
-
-Features included:
-- Rule-Based Detection: Medical guidelines + percentile-based + statistical thresholds
-- Model-Based Detection: Prophet forecasting with residual analysis
-- Cluster-Based Detection: DBSCAN/KMeans pattern detection
-- Ensemble Scoring: Combines all methods with confidence scores & severity levels
-- Multi-Anomaly Types: Point, Contextual, & Collective anomalies supported
-- Visualization: Time-series with confidence intervals, method comparison, heatmaps, severity
-- Interactive Controls: Thresholds, method selection, date range, confidence filtering
-- Export & Reports: Anomaly data, JSON reports, severity breakdown
-- False Positive Reduction: Consensus-based detection, temporal smoothing
-
-ANOMALY TYPES SUPPORTED:
-1. Point Anomaly: Single abnormal value (e.g., sudden HR spike)
-2. Contextual Anomaly: Normal value but abnormal in context (time, activity level)
-3. Collective Anomaly: Pattern-based anomalies over time window (e.g., sustained elevation)
-
-DETECTION METHODS:
-A. Rule-Based: Medical thresholds + percentile adapting
-B. Model-Based: Prophet trend/seasonality learning
-C. Cluster-Based: DBSCAN finds unusual patterns
-=> Ensemble: Votes from all 3 methods, confidence = (# methods voting) / 3
-
-Severity Levels:
-- LOW (1): Single method triggers, moderate confidence
-- MEDIUM (2): 2 methods agree, moderate-high confidence
-- HIGH (3): All 3 methods agree or part of temporal pattern
-
-Dependencies (install before running):
-pip install pandas numpy plotly scikit-learn scipy matplotlib streamlit prophet tsfresh
-
-Notes:
-- prophet, tsfresh and dbscan are optional. The module will fall back gracefully.
-- Severity assignment based on consensus + temporal context
-
-Usage:
-streamlit run src/visualize_anomaly.py
-"""
 
 # Core imports
 import warnings
@@ -982,6 +939,49 @@ if HAS_STREAMLIT:
         st.set_page_config(page_title='Milestone 3: Anomaly Detection', layout='wide')
         st.title('🚨 Milestone 3 — Anomaly Detection & Visualization')
 
+        # ===== SMART COLUMN DETECTION FUNCTION =====
+        def smart_detect_columns(df):
+            """Smart column detection for both raw and processed files."""
+            df.columns = df.columns.str.lower().str.strip()
+            
+            # Detect DATE column
+            date_col = None
+            date_patterns = ['ds', 'timestamp', 'date', 'datetime', 'activitydate', 'logdate', 'sleepdate', 'time', 'starttime', 'endtime', 'startdate', 'enddate']
+            for col in df.columns:
+                col_lower = col.lower()
+                for pattern in date_patterns:
+                    if col_lower == pattern or col_lower.endswith(pattern):
+                        date_col = col
+                        break
+                if date_col:
+                    break
+            
+            # Detect VALUE column
+            value_col = None
+            value_patterns = ['y', 'value', 'steps', 'step_count', 'heart_rate', 'heartrate', 'duration', 'duration_minutes', 
+                             'metric', 'val', 'sleep_hours', 'hr', 'bpm', 'count', 'minutesasleep', 'minutes_asleep']
+            
+            for pattern in value_patterns:
+                for col in df.columns:
+                    col_lower = col.lower()
+                    if col_lower == pattern:
+                        value_col = col
+                        break
+                if value_col:
+                    break
+            
+            if not value_col:
+                for col in df.columns:
+                    col_lower = col.lower()
+                    for pattern in value_patterns:
+                        if pattern in col_lower and col_lower != 'timestamp' and col_lower != 'date' and 'date' not in col_lower:
+                            value_col = col
+                            break
+                    if value_col:
+                        break
+            
+            return date_col, value_col
+
         st.sidebar.header('Configuration')
         use_sample = st.sidebar.checkbox('Use sample data (demo)', value=True)
         use_tsfresh = st.sidebar.checkbox('Use TSFresh (if installed)', value=False)
@@ -989,6 +989,12 @@ if HAS_STREAMLIT:
         outlier_threshold = st.sidebar.slider('Cluster outlier threshold (fraction)', min_value=0.01, max_value=0.2, value=0.05, step=0.01)
         cluster_method = st.sidebar.selectbox('Clustering method', options=['kmeans','dbscan','lof'])
         dark_mode = st.sidebar.checkbox('Dark mode', value=False)
+        
+        # ===== NEW: File size optimization settings =====
+        st.sidebar.markdown('---')
+        st.sidebar.markdown('**Performance Settings**')
+        max_rows = st.sidebar.number_input("Max rows per file (for large datasets)", 5000, 50000, 10000, step=1000)
+        
         st.sidebar.markdown('---')
         st.sidebar.markdown('**Thresholds (editable)**')
         # show default rules & allow edit
@@ -1004,7 +1010,7 @@ if HAS_STREAMLIT:
         rules['heart_rate']['sustained_minutes'] = st.sidebar.number_input('HR sustained (minutes)', value=int(rules['heart_rate']['sustained_minutes']))
         st.sidebar.markdown('---')
         st.sidebar.markdown('Data / Export')
-        uploaded = st.sidebar.file_uploader('Upload preprocessed CSV (heart_rate/steps/sleep) or leave demo', type=['csv','zip'])
+        uploaded = st.sidebar.file_uploader('Upload CSV file (processed or raw FitBit)', type=['csv','zip'])
 
         # Apply dark mode CSS early
         _apply_streamlit_dark_css(dark_mode)
@@ -1013,32 +1019,83 @@ if HAS_STREAMLIT:
             preprocessed = create_sample_data_with_anomalies()
             st.info('Using sample data (demo).')
         else:
-            # try load files from uploaded zip or csvs
+            # ===== OPTIMIZED: Smart file loading with sampling =====
             preprocessed = {}
-            st.info('Please upload three CSVs named heart_rate.csv, steps.csv, sleep.csv or a zip containing them.')
-            if uploaded is not None:
-                try:
-                    if uploaded.type == 'application/zip':
-                        import zipfile
-                        z = zipfile.ZipFile(uploaded)
-                        for name in z.namelist():
-                            if 'heart' in name.lower():
-                                preprocessed['heart_rate'] = pd.read_csv(z.open(name))
-                            if 'step' in name.lower():
-                                preprocessed['steps'] = pd.read_csv(z.open(name))
-                            if 'sleep' in name.lower():
-                                preprocessed['sleep'] = pd.read_csv(z.open(name))
+            try:
+                if uploaded.type == 'application/zip':
+                    import zipfile
+                    z = zipfile.ZipFile(uploaded)
+                    for name in z.namelist():
+                        if name.endswith('.csv'):
+                            df = pd.read_csv(z.open(name), low_memory=False)
+                            file_size = len(df)
+                            
+                            # Auto-sample for performance
+                            if file_size > max_rows:
+                                st.warning(f"⚠️ {name}: {file_size:,} rows. Sampling to {max_rows:,} rows")
+                                df = df.sample(n=max_rows, random_state=42).sort_values(df.columns[0])
+                            
+                            # Smart column detection
+                            date_col, value_col = smart_detect_columns(df)
+                            
+                            if date_col and value_col:
+                                df_clean = pd.DataFrame()
+                                try:
+                                    df_clean['timestamp'] = pd.to_datetime(df[date_col], errors='coerce')
+                                    df_clean['value'] = pd.to_numeric(df[value_col], errors='coerce')
+                                    df_clean = df_clean.dropna()
+                                    
+                                    if len(df_clean) > 0:
+                                        # Infer type from filename
+                                        fname = name.lower()
+                                        if 'heart' in fname or 'hr' in fname:
+                                            preprocessed['heart_rate'] = df_clean.rename(columns={'value': 'heart_rate'})
+                                        elif 'step' in fname:
+                                            preprocessed['steps'] = df_clean.rename(columns={'value': 'step_count'})
+                                        elif 'sleep' in fname:
+                                            preprocessed['sleep'] = df_clean.rename(columns={'value': 'duration_minutes'})
+                                        st.success(f"✅ Loaded {name} ({len(df_clean)} records)")
+                                except Exception as e:
+                                    st.error(f"❌ {name}: Could not parse - {str(e)[:100]}")
+                            else:
+                                st.error(f"❌ {name}: Could not detect date/value columns. Found: {list(df.columns[:5])}")
+                else:
+                    # Single CSV file
+                    df = pd.read_csv(uploaded, low_memory=False)
+                    file_size = len(df)
+                    
+                    # Auto-sample for performance
+                    if file_size > max_rows:
+                        st.warning(f"⚠️ {uploaded.name}: {file_size:,} rows. Sampling to {max_rows:,} rows")
+                        df = df.sample(n=max_rows, random_state=42).sort_values(df.columns[0])
+                    
+                    # Smart column detection
+                    date_col, value_col = smart_detect_columns(df)
+                    
+                    if date_col and value_col:
+                        df_clean = pd.DataFrame()
+                        try:
+                            df_clean['timestamp'] = pd.to_datetime(df[date_col], errors='coerce')
+                            df_clean['value'] = pd.to_numeric(df[value_col], errors='coerce')
+                            df_clean = df_clean.dropna()
+                            
+                            if len(df_clean) > 0:
+                                fname = uploaded.name.lower()
+                                if 'heart' in fname or 'hr' in fname:
+                                    preprocessed['heart_rate'] = df_clean.rename(columns={'value': 'heart_rate'})
+                                elif 'step' in fname:
+                                    preprocessed['steps'] = df_clean.rename(columns={'value': 'step_count'})
+                                elif 'sleep' in fname:
+                                    preprocessed['sleep'] = df_clean.rename(columns={'value': 'duration_minutes'})
+                                st.success(f"✅ Loaded {uploaded.name} ({len(df_clean)} records)")
+                        except Exception as e:
+                            st.error(f"❌ Could not parse - {str(e)[:100]}")
                     else:
-                        # assume single CSV; try to infer
-                        df = pd.read_csv(uploaded)
-                        if 'heart_rate' in df.columns:
-                            preprocessed['heart_rate'] = df
-                        elif 'step_count' in df.columns:
-                            preprocessed['steps'] = df
-                        elif 'duration_minutes' in df.columns:
-                            preprocessed['sleep'] = df
-                except Exception as e:
-                    st.error('Error reading uploaded file: ' + str(e))
+                        st.error(f"❌ Could not detect date/value columns. Found: {list(df.columns[:5])}")
+                        st.info("Expected columns: date (ds, timestamp, activityDate, sleepDate) + value (y, value, heart_rate, steps, duration)")
+                        
+            except Exception as e:
+                st.error('Error reading uploaded file: ' + str(e)[:150])
 
         # update detector objects
         pipeline = VisualizeAnomalyPipeline(use_tsfresh=use_tsfresh)
