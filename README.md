@@ -525,6 +525,8 @@ This dashboard is **NOT a substitute for professional medical diagnosis or treat
 
 ## License & Attribution
 
+This project is licensed under the **MIT License**. See the [LICENSE](LICENSE) file for full terms.
+
 This project is part of the Infosys FitPulse Health Anomaly Detection initiative.
 
 ### Technologies Used:
