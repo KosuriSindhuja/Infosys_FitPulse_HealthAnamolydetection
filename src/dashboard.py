@@ -1,13 +1,10 @@
 import os
-import io
 import base64
 from datetime import datetime, timedelta, date
 import streamlit as st
 import pandas as pd
 import numpy as np
-from sklearn.ensemble import IsolationForest
 import plotly.graph_objects as go
-import matplotlib.pyplot as plt
 from fpdf import FPDF
 from prophet import Prophet
 
@@ -22,10 +19,27 @@ st.set_page_config(
 # -----------------------------
 st.markdown(
     """
-    <h1 style="margin:0; padding:0;">FitPlus Health Insights Dashboard</h1>
+    <div style="display:flex; align-items:center; gap:0.75rem; margin:0; padding:0;">
+        <h1 style="margin:0; padding:0;">FitPlus Health Insights Dashboard</h1>
+        <div style="display:flex; align-items:center; justify-content:center;">
+            <svg viewBox="0 0 64 64" width="60" height="60" xmlns="http://www.w3.org/2000/svg">
+                <polyline points="4,34 16,34 22,22 30,44 38,18 46,34 60,34" 
+                          fill="none" stroke="#ffffff" stroke-width="6" stroke-linecap="round" stroke-linejoin="round" />
+            </svg>
+        </div>
+    </div>
     <p style="color:#9fb4c8;">Visualize your fitness patterns, analyze anomalies, and forecast health trends.</p>
     """,
     unsafe_allow_html=True
+)
+
+st.sidebar.markdown(
+    """
+    <div style="padding:0.35rem 0.9rem; border-radius:999px; background:linear-gradient(135deg, #ff8c00, #ffb347); color:#ffffff; font-weight:800; font-family:system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; letter-spacing:0.12em; font-size:0.85rem; text-align:center; margin-bottom:0.5rem;">
+        FITPULSE
+    </div>
+    """,
+    unsafe_allow_html=True,
 )
 
 st.sidebar.title("Navigation")
@@ -61,6 +75,16 @@ PROCESSED_DATA_PATH = os.path.join(
     "processed",
     "preprocessed_data.csv",
 )
+
+
+def metric_unit(metric_key: str) -> str:
+    if "Heart" in metric_key:
+        return "bpm"
+    if "Step" in metric_key:
+        return "steps"
+    if "Sleep" in metric_key:
+        return "hours"
+    return "units"
 
 
 @st.cache_data(show_spinner=False)
@@ -120,11 +144,407 @@ def derive_daily_health_status(df):
 
     return "On Track", "calm"
 
+
+def extract_metric_time_series(df: pd.DataFrame, filename: str = None):
+    """Extract daily time series for Heart Rate, Steps, Sleep from a generic CSV.
+
+    Returns a dict mapping metric name ("Heart Rate", "Steps", "Sleep") to
+    a DataFrame with columns ['ds', 'y'] (daily aggregated).
+
+    This is used by both the Analysis and Anomalies tabs so that users can
+    upload *any* reasonable CSV (raw or processed, train/test, etc.).
+    """
+
+    if df is None or df.empty:
+        return {}
+
+    work = df.copy()
+    work.columns = [str(c).strip() for c in work.columns]
+
+    # Detect date/time column
+    date_col = None
+    date_patterns = [
+        "ds",
+        "timestamp",
+        "date",
+        "datetime",
+        "activitydate",
+        "logdate",
+        "sleepdate",
+        "time",
+        "starttime",
+        "endtime",
+        "startdate",
+        "enddate",
+    ]
+    for col in work.columns:
+        cl = col.lower()
+        for patt in date_patterns:
+            if cl == patt or cl.endswith(patt):
+                date_col = col
+                break
+        if date_col:
+            break
+
+    if not date_col:
+        return {}
+
+    ds_series = pd.to_datetime(work[date_col], errors="coerce")
+    # Remove timezone information if present (Prophet requires tz-naive)
+    try:
+        if getattr(ds_series.dt, "tz", None) is not None:
+            try:
+                ds_series = ds_series.dt.tz_convert(None)
+            except TypeError:
+                ds_series = ds_series.dt.tz_localize(None)
+    except Exception:
+        # If anything goes wrong, keep the original parsed dates
+        pass
+
+    work["ds"] = ds_series
+    work = work.dropna(subset=["ds"])
+    if work.empty:
+        return {}
+
+    # Metric-specific column patterns
+    metric_patterns = {
+        "Heart Rate": ["heart_rate", "heartrate", "hr", "bpm"],
+        "Steps": ["steps", "step_count", "step"],
+        "Sleep": [
+            "sleep_hours",
+            "minutesasleep",
+            "minutes_asleep",
+            "sleepduration",
+            "sleep_duration",
+            "totalsleep",
+        ],
+    }
+
+    series = {}
+
+    for metric_name, patterns in metric_patterns.items():
+        # Find the first matching column for this metric
+        value_col = None
+        for col in work.columns:
+            cl = col.lower()
+            if col == date_col or col == "ds":
+                continue
+            if any(patt in cl for patt in patterns):
+                value_col = col
+                break
+
+        if not value_col:
+            continue
+
+        mdf = pd.DataFrame()
+        mdf["ds"] = work["ds"].dt.floor("D")
+        mdf["y"] = pd.to_numeric(work[value_col], errors="coerce")
+        mdf = mdf.dropna(subset=["y"])
+        if mdf.empty:
+            continue
+
+        # Aggregate to daily level: heart rate → mean, steps/sleep → sum
+        if metric_name == "Heart Rate":
+            agg = "mean"
+        else:
+            agg = "sum"
+
+        mdf = (
+            mdf.groupby("ds", as_index=False)["y"].agg(agg).sort_values("ds").reset_index(drop=True)
+        )
+        series[metric_name] = mdf
+
+    # Fallback: ds + generic 'y' column, infer metric from filename
+    if not series and "y" in work.columns:
+        inferred_metric = None
+        if filename:
+            fname = filename.lower()
+            if "heart" in fname or "hr" in fname or "heartrate" in fname:
+                inferred_metric = "Heart Rate"
+            elif "step" in fname:
+                inferred_metric = "Steps"
+            elif "sleep" in fname:
+                inferred_metric = "Sleep"
+
+        if inferred_metric:
+            mdf = pd.DataFrame()
+            mdf["ds"] = work["ds"].dt.floor("D")
+            mdf["y"] = pd.to_numeric(work["y"], errors="coerce")
+            mdf = mdf.dropna(subset=["y"])
+            if not mdf.empty:
+                agg = "mean" if inferred_metric == "Heart Rate" else "sum"
+                mdf = (
+                    mdf.groupby("ds", as_index=False)["y"].agg(agg).sort_values("ds").reset_index(drop=True)
+                )
+                series[inferred_metric] = mdf
+
+    return series
+
+
+def build_and_show_pdf_report(report_text: str, metric_type: str):
+    """Create a PDF from the given report text and show download/preview controls in Streamlit."""
+
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.set_left_margin(20)
+    pdf.set_right_margin(20)
+    pdf.add_page()
+    pdf.set_font("Arial", size=10)
+    text_width = pdf.w - pdf.l_margin - pdf.r_margin
+
+    def sanitize_for_pdf(text):
+        """Remove non-ASCII characters and Unicode symbols, replacing with safe ASCII equivalents."""
+        if not isinstance(text, str):
+            text = str(text)
+
+        replacements = {
+            'σ': 'std_dev', 'Σ': 'SIGMA', 'μ': 'mean',
+            '↑': '[UP]', '↓': '[DOWN]', '→': '[RIGHT]', '←': '[LEFT]',
+            '⚠️': '[ALERT]', '⚠': '[ALERT]', '✓': '[OK]', '✗': '[FAIL]',
+            '•': '-', '◆': '*', '○': 'o', '●': '*', '★': '*', '☆': '*',
+            '™': '(TM)', '©': '(C)', '®': '(R)',
+            '€': 'EUR', '£': 'GBP', '¥': 'YEN',
+            '°': ' deg', '±': ' +/- ', '×': 'x', '÷': '/',
+            '≈': ' approx ', '≠': ' != ', '≤': ' <= ', '≥': ' >= ',
+            '√': 'sqrt', '∞': 'inf', '∑': 'sum', '∫': 'integral',
+            '∆': 'DELTA', 'λ': 'lambda', 'π': 'pi', 'θ': 'theta',
+            'Δ': 'DELTA', 'Ω': 'OMEGA',
+            'α': 'alpha', 'β': 'beta', 'γ': 'gamma', 'δ': 'delta',
+            'ε': 'epsilon', 'ζ': 'zeta', 'η': 'eta', 'κ': 'kappa',
+            'ν': 'nu', 'ρ': 'rho', 'τ': 'tau', 'υ': 'upsilon',
+            'φ': 'phi', 'χ': 'chi', 'ψ': 'psi', 'ω': 'omega',
+            '–': '-', '—': '-', '‐': '-', '‑': '-', '−': '-',
+            '…': '...', '·': '.', '‰': '/1000',
+            '′': "'", '″': '"', '‴': "'''",
+            '‵': "'", '‶': '"',
+            'ʹ': "'", 'ʺ': '"', 'ʻ': "'", 'ʼ': "'", 'ʽ': "'", 'ʾ': "'", 'ʿ': "'",
+        }
+
+        result = text
+        for unicode_char, replacement in replacements.items():
+            result = result.replace(unicode_char, replacement)
+
+        try:
+            result = result.encode('ascii', 'ignore').decode('ascii')
+        except Exception:
+            result = ''.join(char if ord(char) < 128 else '?' for char in result)
+
+        return result
+
+    # Add text to PDF with proper encoding and width handling
+    for line in report_text.split('\n'):
+        if line.strip():
+            clean_line = sanitize_for_pdf(line)
+            if clean_line.strip():
+                pdf.multi_cell(text_width, 5, clean_line, align='L')
+        else:
+            pdf.ln(2)
+
+    # Save PDF to disk
+    pdf_filename = f"HealthReport_{metric_type.replace(' ', '')}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+    pdf.output(pdf_filename)
+
+    # Read PDF bytes once
+    with open(pdf_filename, "rb") as f:
+        pdf_bytes = f.read()
+
+    # Display success and download button
+    st.success("✓ Report generated successfully!")
+    st.markdown("---")
+
+    st.download_button(
+        "📥 Download PDF Report",
+        data=pdf_bytes,
+        file_name=pdf_filename,
+        mime="application/pdf",
+        use_container_width=True,
+    )
+
+    # Inline PDF preview (centered, like a printed page)
+    st.markdown("### Report Preview")
+    base64_pdf = base64.b64encode(pdf_bytes).decode("utf-8")
+    pdf_display = f'''
+    <div style="display:flex; justify-content:center;">
+      <iframe
+        src="data:application/pdf;base64,{base64_pdf}"
+        style="width:100%; max-width:900px; height:800px; border:1px solid #ccc; box-shadow:0 0 8px rgba(0,0,0,0.1);"
+        type="application/pdf">
+      </iframe>
+    </div>
+    '''
+    st.markdown(pdf_display, unsafe_allow_html=True)
+
+
+def append_recommendations_and_disclaimer(report_text: str, context_line: str) -> str:
+     return report_text + f"""
+{'='*80}
+
+HEALTH RECOMMENDATIONS & ACTION PLAN
+-------------------------------------
+
+{context_line}
+
+1. IMMEDIATE ACTIONS:
+    - Continue monitoring your health metrics regularly
+    - Note any lifestyle changes that correlate with anomalies
+    - Maintain current positive patterns
+
+2. SHORT-TERM IMPROVEMENTS (1-2 weeks):
+    - Identify and document triggers for anomalies
+    - Adjust routines based on patterns identified
+    - Increase consistency in health habits
+
+3. LONG-TERM STRATEGY (1-3 months):
+    - Work toward optimal health targets
+    - Build sustainable habits
+    - Track improvement trends
+
+4. WHEN TO SEEK PROFESSIONAL HELP:
+    - If anomalies become frequent or severe
+    - If trends are consistently negative
+    - If you experience symptoms or feel unwell
+    - After emergency alerts or concerning readings
+
+PROFESSIONAL CONSULTATION:
+If you have concerns about your health metrics or the anomalies detected, 
+please consult with your healthcare provider for personalized medical advice.
+
+{'='*80}
+
+Report Disclaimer:
+This report is generated for informational and educational purposes only.
+It is not a substitute for professional medical diagnosis or treatment.
+Please consult with a qualified healthcare provider for medical concerns.
+
+Generated by: FitPlus Health Insights Dashboard
+Report Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+"""
+
+
+def format_metric_analysis_block(m_key: str, m_mean: float, m_median: float, m_std: float,
+                                                                 m_min: float, m_max: float, m_recent_trend: float,
+                                                                 m_unit: str) -> str:
+        """Return the repeated analysis text block for a single metric (stats + narrative)."""
+
+        block = f"""
+Metric: {m_key}
+~~~~~~~~~~~~~~~
+
+Key Statistics:
+    - Average: {m_mean:.2f} {m_unit}
+    - Median: {m_median:.2f} {m_unit}
+    - Standard Deviation: {m_std:.2f}
+    - Range: {m_min:.2f} - {m_max:.2f} {m_unit}
+    - 7-Day Trend: {'Increasing' if m_recent_trend > 0 else 'Decreasing'} ({abs(m_recent_trend):.2f} {m_unit})
+
+"""
+
+        # Heart-rate specific narrative
+        if "Heart" in m_key:
+                health_status = (
+                        "Normal" if 60 <= m_mean <= 100 else "Elevated" if m_mean > 100 else "Low"
+                )
+                emergency = m_mean > 120 or m_mean < 40
+
+                block += f"""
+HEART RATE ANALYSIS
+-------------------
+
+Health Status: {health_status}
+
+Your average resting heart rate of {m_mean:.1f} bpm indicates a {health_status.lower()} 
+cardiovascular state. The medical standard for healthy resting heart rate in adults is 
+60-100 bpm.
+
+Pattern Analysis:
+    - Consistency Score: {100 - (m_std / max(m_mean, 1) * 100):.1f}%
+    - Your heart rate shows {'stable' if m_std < m_mean * 0.15 else 'variable'} patterns
+    - Recent trend: {'Improving cardiovascular fitness' if m_recent_trend < 0 else 'Increased stress or activity'}
+
+"""
+
+                if emergency:
+                        block += f"""
+[EMERGENCY ALERT]
+Your heart rate readings show concerning values ({m_min:.0f}-{m_max:.0f} bpm).
+ACTION REQUIRED: Consult a healthcare provider immediately.
+
+"""
+
+        # Steps-specific narrative
+        elif "Step" in m_key:
+                daily_avg = m_mean
+                activity_level = (
+                        "Sedentary"
+                        if daily_avg < 5000
+                        else "Low Active"
+                        if daily_avg < 7500
+                        else "Somewhat Active"
+                        if daily_avg < 10000
+                        else "Active"
+                        if daily_avg < 12500
+                        else "Very Active"
+                )
+
+                block += f"""
+DAILY ACTIVITY ANALYSIS
+-----------------------
+
+Activity Level: {activity_level}
+
+Your average daily step count of {daily_avg:.0f} steps indicates a {activity_level.lower()} 
+lifestyle. The World Health Organization recommends 10,000 steps daily for optimal 
+health benefits.
+
+Pattern Analysis:
+    - Consistency Score: {100 - (m_std / max(m_mean, 1) * 100):.1f}%
+    - Activity patterns: {'Regular and consistent' if m_std < m_mean * 0.25 else 'Highly variable'}
+    - Recent trend: {'Increasing physical activity' if m_recent_trend > 0 else 'Declining activity levels'}
+
+"""
+
+        # Sleep-specific narrative
+        elif "Sleep" in m_key:
+                sleep_quality = (
+                        "Excellent"
+                        if 7 <= m_mean <= 9
+                        else "Good"
+                        if 6 <= m_mean < 7
+                        else "Poor"
+                        if m_mean < 6
+                        else "Too Much"
+                )
+
+                block += f"""
+SLEEP DURATION ANALYSIS
+-----------------------
+
+Sleep Quality Rating: {sleep_quality}
+
+Your average nightly sleep of {m_mean:.1f} hours is rated as {sleep_quality.lower()}. 
+The medical standard recommends 7-9 hours of quality sleep per night for adults.
+
+Pattern Analysis:
+    - Consistency Score: {100 - (m_std / max(m_mean, 1) * 100):.1f}%
+    - Sleep patterns: {'Very stable sleep schedule' if m_std < m_mean * 0.15 else 'Irregular sleep patterns'}
+    - Recent trend: {'Improving sleep duration' if m_recent_trend > 0 else 'Declining sleep hours'}
+
+"""
+
+        return block
+
 files = {
     "Heart Rate": os.path.join(MODULE2_DIR, "daily_heart_rate.csv"),
     "Steps": os.path.join(MODULE2_DIR, "daily_steps.csv"),
     "Sleep": os.path.join(MODULE2_DIR, "daily_sleep.csv")
 }
+
+
+def normalize_metric_df(metric_df: pd.DataFrame) -> pd.DataFrame:
+    df_m = metric_df.rename(columns={"ds": "date", "y": "value"}).copy()
+    df_m["date"] = pd.to_datetime(df_m["date"], errors="coerce")
+    df_m["value"] = pd.to_numeric(df_m["value"], errors="coerce")
+    return df_m.dropna(subset=["date", "value"]).sort_values("date")
 
 
 @st.cache_data(show_spinner=False)
@@ -400,9 +820,62 @@ with tabs[0]:
         unsafe_allow_html=True,
     )
 
-    # Derive a compact health status from processed data
-    processed_df = load_processed_data(PROCESSED_DATA_PATH)
-    health_status_label, health_mood = derive_daily_health_status(processed_df)
+    # Derive a compact health status
+    uploaded_series = st.session_state.get("analysis_user_data", {})
+
+    if uploaded_series:
+        # Use latest day from user-uploaded daily series
+        latest_date = None
+        for mdf in uploaded_series.values():
+            if not mdf.empty:
+                d = mdf["ds"].max().date()
+                if latest_date is None or d > latest_date:
+                    latest_date = d
+
+        avg_hr = None
+        total_steps = None
+        total_sleep = None
+
+        if latest_date is not None:
+            if "Heart Rate" in uploaded_series:
+                df_hr = uploaded_series["Heart Rate"]
+                row = df_hr[df_hr["ds"].dt.date == latest_date]
+                if not row.empty:
+                    avg_hr = row["y"].iloc[-1]
+
+            if "Steps" in uploaded_series:
+                df_steps = uploaded_series["Steps"]
+                row = df_steps[df_steps["ds"].dt.date == latest_date]
+                if not row.empty:
+                    total_steps = row["y"].iloc[-1]
+
+            if "Sleep" in uploaded_series:
+                df_sleep = uploaded_series["Sleep"]
+                row = df_sleep[df_sleep["ds"].dt.date == latest_date]
+                if not row.empty:
+                    total_sleep = row["y"].iloc[-1]
+
+        # Basic rules matching derive_daily_health_status
+        if latest_date is None or avg_hr is None or np.isnan(avg_hr) or total_steps is None or np.isnan(total_steps):
+            health_status_label, health_mood = "Status Unknown", "neutral"
+        elif (total_sleep is not None and not np.isnan(total_sleep) and total_sleep < 5.5) or avg_hr > 95:
+            health_status_label, health_mood = "Needs Rest", "tired"
+        elif total_steps < 3000:
+            health_status_label, health_mood = "Low Activity", "sleepy"
+        elif (
+            total_steps >= 10000
+            and total_sleep is not None
+            and not np.isnan(total_sleep)
+            and 7 <= total_sleep <= 9
+            and 55 <= avg_hr <= 85
+        ):
+            health_status_label, health_mood = "Great Balance", "happy"
+        else:
+            health_status_label, health_mood = "On Track", "calm"
+    else:
+        # Fallback to project sample data if no uploads are available
+        processed_df = load_processed_data(PROCESSED_DATA_PATH)
+        health_status_label, health_mood = derive_daily_health_status(processed_df)
 
     # Show status badge as a short 2-3 word summary with an emoji
     status_container = st.container()
@@ -425,7 +898,7 @@ with tabs[0]:
     with status_container:
         st.markdown(
             f"""
-                        <div style="margin:0.25rem 0 0.75rem 0;">
+                        <div style="margin:0.25rem 0 0.25rem 0;">
                             <span style="font-weight:600; color:#2c3e50; margin-right:0.35rem;">Health Status:</span>
                             <span style="display:inline-flex; align-items:center; gap:0.3rem; padding:0.15rem 0.6rem; border-radius:999px; background:{badge_color}; color:white; font-weight:600; font-size:0.9rem;">
                                 <span>{mood_emoji}</span>
@@ -436,28 +909,47 @@ with tabs[0]:
             unsafe_allow_html=True,
         )
 
+        # If no user-uploaded data is driving the status, show a small note
+        if not uploaded_series:
+            st.caption("No current user-uploaded data detected. Showing sample project data.")
+
     # Load today's stats
     today = pd.Timestamp.now().normalize()
 
-    def get_today_stat(path, value_col):
-        if os.path.exists(path):
-            df = pd.read_csv(path)
-            if "ds" in df.columns:
-                df["ds"] = pd.to_datetime(df["ds"])
-                # Find rows where ds is today (any time)
-                row = df[df["ds"].dt.normalize() == today]
-                if not row.empty:
-                    return row.iloc[0][value_col]
-        return None
+    if uploaded_series:
+        # Use uploaded daily series for today's metrics
+        def get_today_from_series(metric_name):
+            mdf = uploaded_series.get(metric_name)
+            if mdf is None or mdf.empty:
+                return None
+            row = mdf[mdf["ds"].dt.normalize() == today]
+            if not row.empty:
+                return row["y"].iloc[-1]
+            return None
 
-    hr = get_today_stat(files["Heart Rate"], "y")
-    steps = get_today_stat(files["Steps"], "y")
-    sleep = get_today_stat(files["Sleep"], "y")
+        hr = get_today_from_series("Heart Rate")
+        steps = get_today_from_series("Steps")
+        sleep = get_today_from_series("Sleep")
+    else:
+        def get_today_stat(path, value_col):
+            if os.path.exists(path):
+                df = pd.read_csv(path)
+                if "ds" in df.columns:
+                    df["ds"] = pd.to_datetime(df["ds"])
+                    # Find rows where ds is today (any time)
+                    row = df[df["ds"].dt.normalize() == today]
+                    if not row.empty:
+                        return row.iloc[0][value_col]
+            return None
+
+        hr = get_today_stat(files["Heart Rate"], "y")
+        steps = get_today_stat(files["Steps"], "y")
+        sleep = get_today_stat(files["Sleep"], "y")
 
     col1, col2, col3 = st.columns(3)
-    col1.metric("Today's Avg Heart Rate", f"{hr:.0f} bpm" if hr else "-", delta=None)
-    col2.metric("Today's Steps", f"{steps:.0f}" if steps else "-", delta=None)
-    col3.metric("Last Night's Sleep", f"{sleep:.1f} hrs" if sleep else "-", delta=None)
+    col1.metric("Today's Avg Heart Rate", f"{hr:.0f} bpm" if hr is not None else "-", delta=None)
+    col2.metric("Today's Steps", f"{steps:.0f}" if steps is not None else "-", delta=None)
+    col3.metric("Last Night's Sleep", f"{sleep:.1f} hrs" if sleep is not None else "-", delta=None)
 
     # Anomaly summary (today)
     anomaly_summary = "No anomalies detected today."
@@ -476,31 +968,53 @@ with tabs[0]:
     st.markdown("#### Last 7 Days Overview")
     spark_col1, spark_col2, spark_col3 = st.columns(3)
 
-    def sparkline(path, label, col):
-        if os.path.exists(path):
-            df = pd.read_csv(path)
-            if "ds" in df.columns:
-                df["ds"] = pd.to_datetime(df["ds"])
-                df["date"] = df["ds"].dt.normalize()
-                # Build a fixed 7-day window ending today
-                end_date = today
-                start_date = today - pd.Timedelta(days=6)
-                date_index = pd.date_range(start_date, end_date, freq="D")
+    def sparkline_series(mdf, label, col):
+        if mdf is None or mdf.empty:
+            return
+        mdf = mdf.copy()
+        mdf["date"] = mdf["ds"].dt.normalize()
+        end_date = today
+        start_date = today - pd.Timedelta(days=6)
+        date_index = pd.date_range(start_date, end_date, freq="D")
+        daily = (
+            mdf.sort_values("date")
+               .drop_duplicates(subset="date", keep="last")
+               .set_index("date")["y"]
+        )
+        series = daily.reindex(date_index, fill_value=0)
+        col.markdown(f"**{label}**")
+        col.line_chart(series, height=60)
 
-                # Aggregate to one value per day (last value if multiple)
-                daily = (
-                    df.sort_values("date")
-                      .drop_duplicates(subset="date", keep="last")
-                      .set_index("date")["y"]
-                )
-                series = daily.reindex(date_index, fill_value=0)
+    if uploaded_series:
+        sparkline_series(uploaded_series.get("Heart Rate"), "Heart Rate", spark_col1)
+        sparkline_series(uploaded_series.get("Steps"), "Steps", spark_col2)
+        sparkline_series(uploaded_series.get("Sleep"), "Sleep", spark_col3)
+    else:
+        def sparkline(path, label, col):
+            if os.path.exists(path):
+                df = pd.read_csv(path)
+                if "ds" in df.columns:
+                    df["ds"] = pd.to_datetime(df["ds"])
+                    df["date"] = df["ds"].dt.normalize()
+                    # Build a fixed 7-day window ending today
+                    end_date = today
+                    start_date = today - pd.Timedelta(days=6)
+                    date_index = pd.date_range(start_date, end_date, freq="D")
 
-                col.markdown(f"**{label}**")
-                col.line_chart(series, height=60)
+                    # Aggregate to one value per day (last value if multiple)
+                    daily = (
+                        df.sort_values("date")
+                          .drop_duplicates(subset="date", keep="last")
+                          .set_index("date")["y"]
+                    )
+                    series = daily.reindex(date_index, fill_value=0)
 
-    sparkline(files["Heart Rate"], "Heart Rate", spark_col1)
-    sparkline(files["Steps"], "Steps", spark_col2)
-    sparkline(files["Sleep"], "Sleep", spark_col3)
+                    col.markdown(f"**{label}**")
+                    col.line_chart(series, height=60)
+
+        sparkline(files["Heart Rate"], "Heart Rate", spark_col1)
+        sparkline(files["Steps"], "Steps", spark_col2)
+        sparkline(files["Sleep"], "Sleep", spark_col3)
 
 
 # -----------------------------
@@ -508,6 +1022,73 @@ with tabs[0]:
 # -----------------------------
 with tabs[1]:
     st.subheader("📊 Health Data Analysis")
+
+    # User-provided metric files (required for a user-centric deployment)
+    st.markdown("**📁 Upload Health CSV Files**")
+    uploaded_analysis_files = st.file_uploader(
+        "Upload up to 6 CSV files (raw or processed)",
+        type=["csv"],
+        accept_multiple_files=True,
+        key="analysis_upload",
+        help=(
+            "Upload any Fitbit health CSVs (raw or processed, train/test/etc.). "
+            "The dashboard will auto-detect date and metric columns and extract "
+            "daily series for Heart Rate, Steps, and Sleep based on column names."
+        ),
+    )
+
+    # Map uploaded files to metric names used in the checkboxes
+    if uploaded_analysis_files:
+        if len(uploaded_analysis_files) > 6:
+            st.warning("⚠️ Only the first 6 files will be used for analysis.")
+            uploaded_analysis_files = uploaded_analysis_files[:6]
+
+        user_data = {}
+        metric_sources = {}
+        raw_files = []
+        for f in uploaded_analysis_files:
+            try:
+                df_u = pd.read_csv(f, low_memory=False)
+                raw_files.append({"name": f.name, "df": df_u})
+
+                metric_series = extract_metric_time_series(df_u, f.name)
+                if not metric_series:
+                    st.warning(
+                        f"{f.name}: could not detect Heart Rate, Steps, or Sleep columns. "
+                        "Check that it has a date column and metric columns such as heart_rate, steps, sleep_hours, etc.")
+                    continue
+
+                # Merge each detected metric into the session mapping
+                for metric_key, mdf in metric_series.items():
+                    if metric_key in user_data:
+                        combined = (
+                            pd.concat([user_data[metric_key], mdf], ignore_index=True)
+                              .drop_duplicates(subset=["ds"])
+                              .sort_values("ds")
+                        )
+                        user_data[metric_key] = combined
+                    else:
+                        user_data[metric_key] = mdf
+
+                    # Track which files contributed to each metric
+                    metric_sources.setdefault(metric_key, set()).add(f.name)
+
+                detected = ", ".join(metric_series.keys())
+                st.success(f"✅ Loaded {f.name}: detected {detected} for Analysis tab.")
+            except Exception as e:
+                st.error(f"Error reading {f.name}: {str(e)}")
+
+        if user_data:
+            st.session_state["analysis_user_data"] = user_data
+            # Store human-readable source list per metric for display under headings
+            st.session_state["analysis_metric_sources"] = {
+                k: sorted(list(v)) for k, v in metric_sources.items()
+            }
+            # Also keep raw uploaded dataframes so other tabs (Reports, Home) can reuse them
+            st.session_state["analysis_raw_files"] = raw_files
+    else:
+        # If nothing uploaded in this run, keep any existing session data as-is
+        pass
     
     # Date Range Selection with Calendar
     col1, col2 = st.columns([2, 1])
@@ -528,6 +1109,9 @@ with tabs[1]:
         use_all_data = st.checkbox("Analyze All Data", value=False)
         if use_all_data:
             st.info("Will analyze all available data")
+        # Persist the "analyze all data" flag so the Anomalies tab can
+        # use the exact same date-range logic as the Analysis tab.
+        st.session_state["analysis_use_all_data"] = use_all_data
     
     # Metric Selection
     st.markdown("**🔍 Select Metrics to Analyze**")
@@ -549,9 +1133,14 @@ with tabs[1]:
     
     # Run Analysis Button
     if st.button("🔍 Run Analysis", use_container_width=True):
-        if not selected_metrics:
+        if "analysis_user_data" not in st.session_state or not st.session_state["analysis_user_data"]:
+            st.error("Please upload at least one valid CSV file above before running analysis.")
+        elif not selected_metrics:
             st.error("Please select at least one metric to analyze.")
         else:
+            # Remember which metrics were selected for use in the Reports tab
+            st.session_state["analysis_selected_metrics"] = selected_metrics.copy()
+
             # Determine date range
             if use_all_data:
                 start_date = min_date
@@ -565,22 +1154,43 @@ with tabs[1]:
                 date_label = f"{start_date} to {end_date}"
             
             # Analyze each selected metric
+            forecast = None  # will hold Prophet forecast if model fits successfully
             for metric in selected_metrics:
                 st.markdown(f"---")
                 st.markdown(f"## {metric} Analysis ({date_label})")
-                
-                path = files[metric]
-                if not os.path.exists(path):
-                    st.error(f"{metric} data not found.")
+
+                # Show which uploaded files contributed to this metric (if known)
+                src_map = st.session_state.get("analysis_metric_sources", {})
+                if metric in src_map:
+                    sources_str = ", ".join(src_map[metric])
+                    st.caption(f"Data source(s): {sources_str}")
+
+                # Require user-uploaded data for analysis (no backend fallback)
+                if "analysis_user_data" not in st.session_state or metric not in st.session_state["analysis_user_data"]:
+                    st.error(
+                        f"No uploaded data found for {metric}. "
+                        "Please upload a CSV file with this metric above.")
                     continue
-                
+
+                df = st.session_state["analysis_user_data"][metric].copy()
+
                 try:
-                    df = pd.read_csv(path)
                     if 'ds' not in df.columns or 'y' not in df.columns:
                         st.error(f"Invalid format for {metric} (missing 'ds' or 'y').")
                         continue
                     
-                    df['ds'] = pd.to_datetime(df['ds'])
+                    ds_series = pd.to_datetime(df['ds'], errors='coerce')
+                    # Ensure ds is tz-naive for Prophet compatibility
+                    try:
+                        if getattr(ds_series.dt, "tz", None) is not None:
+                            try:
+                                ds_series = ds_series.dt.tz_convert(None)
+                            except TypeError:
+                                ds_series = ds_series.dt.tz_localize(None)
+                    except Exception:
+                        pass
+
+                    df['ds'] = ds_series
                     df = df.sort_values('ds')
 
                     # Choose a friendly y-axis label based on metric type
@@ -680,8 +1290,8 @@ with tabs[1]:
                         else:
                             st.info(f"Need ≥14 data points for Prophet. Current: {len(df_range)}")
                     
-                    # Weekly Seasonality
-                    if len(df_range) >= 14:
+                    # Weekly Seasonality (only if Prophet succeeded and forecast is available)
+                    if len(df_range) >= 14 and forecast is not None:
                         try:
                             col_w, col_y = st.columns(2)
                             
@@ -757,258 +1367,250 @@ with tabs[1]:
 ## ===== ANOMALY DETECTION TAB (Advanced Multi-Method Ensemble) =====
 with tabs[2]:
     st.subheader("🔍 Advanced Anomaly Detection")
-    
-    # ===== ADVANCED COLUMN DETECTION FUNCTION =====
-    def smart_detect_columns(df):
-        """Smart column detection for both raw and processed files."""
-        df.columns = df.columns.str.lower().str.strip()
-        
-        # Detect DATE column (enhanced for raw files including sleep)
-        date_col = None
-        date_patterns = ['ds', 'timestamp', 'date', 'datetime', 'activitydate', 'logdate', 'sleepdate', 'time', 'starttime', 'endtime', 'startdate', 'enddate']
-        for col in df.columns:
-            col_lower = col.lower()
-            for pattern in date_patterns:
-                if col_lower == pattern or col_lower.endswith(pattern):
-                    date_col = col
-                    break
-            if date_col:
-                break
-        
-        # Detect VALUE column (enhanced for raw files including sleep)
-        value_col = None
-        # Order matters - check specific patterns first
-        value_patterns = ['y', 'value', 'steps', 'step_count', 'heart_rate', 'heartrate', 'duration', 'duration_minutes', 'metric', 'val', 'sleep_hours', 'hr', 'bpm', 'count', 'minutesasleep', 'minutes_asleep']
-        
-        for pattern in value_patterns:
-            for col in df.columns:
-                col_lower = col.lower()
-                if col_lower == pattern:  # Exact match first
-                    value_col = col
-                    break
-            if value_col:
-                break
-        
-        # If no exact match, try partial matching
-        if not value_col:
-            for col in df.columns:
-                col_lower = col.lower()
-                for pattern in value_patterns:
-                    if pattern in col_lower and col_lower != 'timestamp' and col_lower != 'date' and 'date' not in col_lower and 'time' not in col_lower:
-                        value_col = col
-                        break
-                if value_col:
-                    break
-        
-        return date_col, value_col
-    
-    # ===== FILE UPLOAD & CONFIG (MINIMAL) =====
+
+    # Use the same date-range logic as the Analysis tab, if available.
+    # If the user checked "Analyze All Data" there, we mirror that here.
+    start_date = None
+    end_date = None
+    analysis_dates = st.session_state.get("analysis_dates")
+    analysis_use_all = st.session_state.get("analysis_use_all_data", False)
+
+    if analysis_use_all:
+        # Match Analysis tab behaviour: all available dates
+        start_date = date(2000, 1, 1)
+        end_date = date.today()
+    elif analysis_dates is not None:
+        # Mirror the currently selected date range from the Analysis tab
+        if isinstance(analysis_dates, tuple) and len(analysis_dates) == 2:
+            start_date, end_date = analysis_dates
+        else:
+            start_date = end_date = analysis_dates
+
+    # Metric selection and detection sensitivity (data comes from Analysis tab uploads)
     col1, col2 = st.columns([2, 1])
-    
+
     with col1:
-        st.markdown("**📁 Upload CSV Files (Raw or Processed)**")
-        uploaded_files = st.file_uploader("Choose CSV files (up to 5)", type=["csv"], accept_multiple_files=True, key="anom_upload")
-    
+        st.markdown("**🔍 Select Metrics to Detect Anomalies**")
+        anom_hr = st.checkbox("Heart Rate", value=True, key="anom_hr")
+        anom_steps = st.checkbox("Steps", value=True, key="anom_steps")
+        anom_sleep = st.checkbox("Sleep", value=True, key="anom_sleep")
+
+        selected_anom_metrics = []
+        if anom_hr:
+            selected_anom_metrics.append("Heart Rate")
+        if anom_steps:
+            selected_anom_metrics.append("Steps")
+        if anom_sleep:
+            selected_anom_metrics.append("Sleep")
+
     with col2:
-        st.markdown("**⚙️ Severity Levels**")
-        low_threshold = st.slider(
-            "Low",
-            0.0,
-            1.0,
-            0.3,
-            step=0.05,
-            key="low_sev_global",
-            help="Use this to control how many points are flagged as unusual. Slide left to see more, right to see only bigger changes.",
+        st.markdown("**⚙️ Detection Sensitivity**")
+        sensitivity_choice = st.selectbox(
+            "How sensitive should anomaly detection be?",
+            [
+                "Balanced (recommended)",
+                "catch more anomalies",
+                "only strong anomalies",
+            ],
+            index=0,
+            key="sensitivity_mode",
+            help=(
+                "Balanced works well for most cases. "
+                "Use 'catch more anomalies' to flag more subtle changes, or 'only strong anomalies' to only show larger deviations."
+            ),
         )
-        medium_threshold = st.slider(
-            "Medium",
-            low_threshold,
-            1.0,
-            0.7,
-            step=0.05,
-            key="med_sev_global",
-            help="Use this to separate minor anomalies from ones you usually want to review.",
+
+        # Optional: for Steps, always flag any Prophet band breach
+        steps_all_prophet = st.checkbox(
+            "For Steps, treat every forecast band breach as an anomaly",
+            value=True,
+            help=(
+                "When enabled, any day where actual steps fall outside the Prophet forecast band "
+                "will be marked as an anomaly, so counts more closely match the with/without-holidays plots."
+            ),
         )
-        high_threshold = st.slider(
-            "High",
-            medium_threshold,
-            1.0,
-            0.85,
-            step=0.05,
-            key="high_sev_global",
-            help="Use this to decide which anomalies you treat as urgent and act on first.",
-        )
-    
-    # Internal settings (not visible to user)
-    max_rows = 10000
-    
-    if uploaded_files:
-        if len(uploaded_files) > 5:
-            st.error("⚠️ Maximum 5 files allowed")
-            uploaded_files = uploaded_files[:5]
-        
-        # SINGLE RUN BUTTON - NO RERUNS
-        if st.button("🚀 Analyze", use_container_width=True, key="analyze_btn"):
+
+        # Map sensitivity choice to internal numeric thresholds for Low / Medium / High severity
+        if sensitivity_choice == "catch more anomalies":
+            # More sensitive: flag more points as anomalies
+            low_threshold, medium_threshold, high_threshold = 0.25, 0.55, 0.8
+        elif sensitivity_choice == "only strong anomalies":
+            # Less sensitive: only stronger deviations are treated as anomalies
+            low_threshold, medium_threshold, high_threshold = 0.5, 0.7, 0.9
+        else:  # Balanced (recommended)
+            low_threshold, medium_threshold, high_threshold = 0.3, 0.7, 0.85
+
+    # SINGLE RUN BUTTON - NO RERUNS (data is taken from Analysis tab uploads)
+    if st.button("🚀 Analyze", use_container_width=True, key="analyze_btn"):
+        if not selected_anom_metrics:
+            st.error("Please select at least one metric for anomaly detection.")
+        elif "analysis_user_data" not in st.session_state or not st.session_state["analysis_user_data"]:
+            st.error("Please upload and process data in the Analysis tab first.")
+        else:
             with st.spinner("Processing anomalies..."):
                 try:
                     processed_data = {}
-                    
-                    for idx, file in enumerate(uploaded_files):
-                        progress_text = f"Processing {file.name}..."
-                        st.info(progress_text)
-                        
-                        # Read CSV with optimization
-                        df = pd.read_csv(file, low_memory=False)
-                        file_size = len(df)
-                        
-                        # Sample if too large (for performance)
-                        if file_size > max_rows:
-                            st.warning(f"⚠️ {file.name}: {file_size:,} rows. Sampling {max_rows:,} for analysis")
-                            df = df.sample(n=max_rows, random_state=42).sort_values(df.columns[0])
-                        
-                        # Smart column detection
-                        date_col, value_col = smart_detect_columns(df)
-                        
-                        if date_col is None:
-                            st.error(f"❌ {file.name}: Could not find date column. Columns: {', '.join(df.columns[:5])}")
+
+                    for metric_type in selected_anom_metrics:
+                        if metric_type not in st.session_state["analysis_user_data"]:
+                            st.warning(
+                                f"No data found for {metric_type} in the uploaded files. "
+                                "Please upload a CSV containing this metric in the Analysis tab. It will be skipped for now."
+                            )
                             continue
-                        
-                        if value_col is None:
-                            st.error(f"❌ {file.name}: Could not find value column. Columns: {', '.join(df.columns[:5])}")
+
+                        df_clean = st.session_state["analysis_user_data"][metric_type].copy()
+                        if 'ds' not in df_clean.columns or 'y' not in df_clean.columns:
+                            st.error(f"{metric_type}: expected columns 'ds' and 'y' in uploaded data.")
                             continue
-                        
-                        # Clean data with optimization
-                        df_clean = pd.DataFrame()
-                        
-                        # Parse dates efficiently
-                        try:
-                            df_clean['ds'] = pd.to_datetime(df[date_col], errors='coerce')
-                        except:
-                            st.error(f"❌ {file.name}: Could not parse date column '{date_col}'")
-                            continue
-                        
-                        # Parse values
-                        try:
-                            df_clean['y'] = pd.to_numeric(df[value_col], errors='coerce')
-                        except:
-                            st.error(f"❌ {file.name}: Could not parse value column '{value_col}'")
-                            continue
-                        
-                        # Remove completely invalid rows
-                        df_clean = df_clean.dropna(subset=['ds', 'y'])
-                        
-                        if len(df_clean) == 0:
-                            st.error(f"❌ {file.name}: No valid data after cleaning")
-                            continue
-                        
-                        # Fill remaining NaN values efficiently
-                        df_clean['y'] = df_clean['y'].fillna(df_clean['y'].median())
-                        
-                        # Sort and reset
-                        df_clean = df_clean.sort_values('ds').reset_index(drop=True)
-                        
+
+                        df_clean['ds'] = pd.to_datetime(df_clean['ds'], errors='coerce')
+                        df_clean['y'] = pd.to_numeric(df_clean['y'], errors='coerce')
+                        df_clean = df_clean.dropna(subset=['ds', 'y']).sort_values('ds').reset_index(drop=True)
+
+                        # Apply the same date filter used in the Analysis tab,
+                        # so both tabs operate on an identical window.
+                        if start_date is not None and end_date is not None:
+                            mask = (df_clean['ds'].dt.date >= start_date) & (df_clean['ds'].dt.date <= end_date)
+                            df_clean = df_clean.loc[mask].reset_index(drop=True)
+
                         if len(df_clean) < 5:
-                            st.error(f"❌ {file.name}: Need at least 5 valid data points (found {len(df_clean)})")
+                            st.error(
+                                f"{metric_type}: Need at least 5 valid data points "
+                                f"(found {len(df_clean)}) in the selected date range"
+                            )
                             continue
-                        
-                        # Determine metric type from filename
-                        fname = file.name.lower()
-                        if 'heart' in fname or 'hr' in fname or 'heartrate' in fname:
-                            metric_type = 'Heart Rate'
-                        elif 'step' in fname:
-                            metric_type = 'Steps'
-                        elif 'sleep' in fname:
-                            metric_type = 'Sleep'
-                        else:
-                            metric_type = f'Metric_{idx}'
-                        
+
                         processed_data[metric_type] = df_clean
-                        st.success(f"✅ {file.name} → {metric_type} ({len(df_clean)} records)")
-                    
+
                     if processed_data:
                         st.session_state['anom_data'] = processed_data
                         st.session_state['anom_config'] = {
                             'low_threshold': low_threshold,
                             'medium_threshold': medium_threshold,
-                            'high_threshold': high_threshold
+                            'high_threshold': high_threshold,
+                            'sensitivity_mode': sensitivity_choice,
+                            'steps_all_prophet': steps_all_prophet,
+                            # Persist the effective date window for use when
+                            # rendering forecasts (e.g., steps with/without holidays).
+                            'start_date': start_date,
+                            'end_date': end_date,
                         }
+                        # Remember which metrics the user asked to analyze so we can
+                        # show explicit "no data" messages for missing ones later.
+                        st.session_state['anom_selected_metrics'] = list(selected_anom_metrics)
                         st.success("✅ Ready to display results")
                         st.rerun()
-                    
+                    else:
+                        st.error("No usable data found for the selected metrics.")
                 except Exception as e:
                     st.error(f"Error: {str(e)[:150]}")
-        
-        # ===== DISPLAY CACHED RESULTS (OPTIMIZED) =====
-        if 'anom_data' in st.session_state:
-            config = st.session_state['anom_config']
-            
-            for metric_name, df in st.session_state['anom_data'].items():
-                df = df.copy()
-                
-                # Handle edge cases
-                if len(df) < 3 or df['y'].std() == 0:
-                    st.warning(f"⚠️ {metric_name}: Insufficient variance for analysis")
-                    continue
-                
-                mean_val = df['y'].mean()
-                std_val = df['y'].std()
 
-                # Friendly label for the value axis based on metric
-                if "heart" in metric_name.lower():
-                    value_label = "Heart Rate (bpm)"
-                elif "step" in metric_name.lower():
-                    value_label = "Steps"
-                elif "sleep" in metric_name.lower():
-                    value_label = "Minutes Asleep"
-                else:
-                    value_label = "Value"
-                
-                # FAST: Vectorized anomaly detection
-                anomaly_scores = np.zeros(len(df))
-                anomaly_types = np.array(['Normal'] * len(df))
-                
-                # Point anomalies (fast, vectorized)
-                outliers = (df['y'] < mean_val - 2.5 * std_val) | (df['y'] > mean_val + 2.5 * std_val)
-                anomaly_scores[outliers] += 0.4
-                anomaly_types[outliers] = 'Point'
-                
-                # Contextual anomalies (fast, vectorized)
-                changes = np.abs(df['y'].diff()).fillna(0)
-                spikes = changes > std_val * 2
-                anomaly_scores[spikes] += 0.3
-                anomaly_types[spikes] = 'Contextual'
-                
-                # Prophet (once, cached via session) - OPTIMIZED for large data
-                if len(df) >= 20 and 'prophet_cache' not in st.session_state:
+    # ===== DISPLAY CACHED RESULTS (OPTIMIZED) =====
+    if 'anom_data' in st.session_state:
+        config = st.session_state['anom_config']
+
+        # Use the last selected metrics if available, otherwise just the ones we have data for
+        selected_for_display = st.session_state.get(
+            'anom_selected_metrics', list(st.session_state['anom_data'].keys())
+        )
+
+        for metric_name in selected_for_display:
+            if metric_name not in st.session_state['anom_data']:
+                # User selected this metric but there was no data in uploaded files
+                st.warning(
+                    f"{metric_name}: No data available from uploaded files. "
+                    "Upload a CSV for this metric in the Analysis tab to see anomalies here."
+                )
+                continue
+
+            df = st.session_state['anom_data'][metric_name].copy()
+
+            # Handle edge cases
+            if len(df) < 3 or df['y'].std() == 0:
+                st.warning(f"⚠️ {metric_name}: Insufficient variance for analysis")
+                continue
+
+            mean_val = df['y'].mean()
+            std_val = df['y'].std()
+
+            # Friendly label for the value axis based on metric
+            if "heart" in metric_name.lower():
+                value_label = "Heart Rate (bpm)"
+            elif "step" in metric_name.lower():
+                value_label = "Steps"
+            elif "sleep" in metric_name.lower():
+                value_label = "Minutes Asleep"
+            else:
+                value_label = "Value"
+
+            # FAST: Vectorized anomaly detection
+            anomaly_scores = np.zeros(len(df))
+            anomaly_types = np.array(['Normal'] * len(df))
+            # Track how many methods vote each point as anomalous
+            method_votes = np.zeros(len(df), dtype=int)
+            # Track Prophet band breaches explicitly so we can
+            # always include them for Steps if the user chooses.
+            prophet_band_hits = np.zeros(len(df), dtype=bool)
+
+            # Point anomalies (fast, vectorized)
+            outliers = (df['y'] < mean_val - 2.5 * std_val) | (df['y'] > mean_val + 2.5 * std_val)
+            anomaly_scores[outliers] += 0.4
+            anomaly_types[outliers] = 'Point'
+            method_votes[outliers] += 1
+
+            # Contextual anomalies (fast, vectorized)
+            changes = np.abs(df['y'].diff()).fillna(0)
+            spikes = changes > std_val * 2
+            anomaly_scores[spikes] += 0.3
+            anomaly_types[spikes] = 'Contextual'
+            method_votes[spikes] += 1
+
+            # Prophet (once, cached via session) - OPTIMIZED for large data
+            if len(df) >= 20:
+                # Initialize cache dict if needed
+                if 'prophet_cache' not in st.session_state:
                     st.session_state['prophet_cache'] = {}
-                
-                if len(df) >= 20 and metric_name not in st.session_state.get('prophet_cache', {}):
-                    try:
+
+                try:
+                    cache = st.session_state['prophet_cache']
+                    forecast = cache.get(metric_name)
+
+                    # Refit Prophet if no forecast cached or length mismatch
+                    if forecast is None or len(forecast) != len(df):
                         df_p = df[['ds', 'y']].copy()
                         df_p.columns = ['ds', 'y']
-                        
+
                         # Suppress Prophet warnings
                         import logging
                         logging.getLogger('prophet').setLevel(logging.WARNING)
-                        
-                        model = Prophet(interval_width=0.95, yearly_seasonality=len(df)>365, 
-                                      weekly_seasonality=True, daily_seasonality=False)
-                        
+
+                        model = Prophet(
+                            interval_width=0.95,
+                            yearly_seasonality=len(df) > 365,
+                            weekly_seasonality=True,
+                            daily_seasonality=False,
+                        )
+
                         # Fit with reduced verbosity
                         with st.spinner(f"Fitting Prophet for {metric_name}..."):
                             model.fit(df_p)
-                        
+
                         forecast = model.predict(df_p[['ds']])
-                        st.session_state['prophet_cache'][metric_name] = forecast
-                        
-                        model_anom = (df['y'].values < forecast['yhat_lower'].values) | (df['y'].values > forecast['yhat_upper'].values)
-                        anomaly_scores[model_anom] += 0.4
-                    except:
-                        pass
-                elif len(df) >= 20 and metric_name in st.session_state.get('prophet_cache', {}):
-                    forecast = st.session_state['prophet_cache'][metric_name]
-                    model_anom = (df['y'].values < forecast['yhat_lower'].values) | (df['y'].values > forecast['yhat_upper'].values)
+                        cache[metric_name] = forecast
+
+                    # Now forecast length should match df length
+                    model_anom = (
+                        df['y'].values < forecast['yhat_lower'].values
+                    ) | (
+                        df['y'].values > forecast['yhat_upper'].values
+                    )
                     anomaly_scores[model_anom] += 0.4
+                    method_votes[model_anom] += 1
+                    prophet_band_hits = model_anom
+                except Exception:
+                    # If Prophet fails for any reason, just skip model-based anomalies
+                    pass
                 
                 # Cluster-based (OPTIMIZED for large data)
                 try:
@@ -1029,33 +1631,73 @@ with tabs[2]:
                     kmeans_anom = np.isin(labels, small)
                     anomaly_scores[kmeans_anom] += 0.3
                     anomaly_types[kmeans_anom] = 'Collective'
+                    method_votes[kmeans_anom] += 1
                     
                     db = DBSCAN(eps=0.5, min_samples=3)
                     dbscan_anom = db.fit_predict(X) == -1
                     anomaly_scores[dbscan_anom] += 0.4
                     anomaly_types[dbscan_anom] = 'Collective'
+                    method_votes[dbscan_anom] += 1
                 except:
                     pass
-                
-                # Normalize
+
+                # Normalize scores into [0, 1] so that the
+                # sensitivity thresholds (low/medium/high) are
+                # applied consistently across metrics.
                 if anomaly_scores.max() > 0:
                     anomaly_scores = anomaly_scores / anomaly_scores.max()
-                
-                severity = np.where(anomaly_scores < config['low_threshold'], 'Low',
-                                   np.where(anomaly_scores < config['medium_threshold'], 'Medium', 'High'))
-                
+
                 df['score'] = anomaly_scores
                 df['type'] = anomaly_types
+                df['votes'] = method_votes
+
+                # Use both the selected sensitivity mode and the
+                # ensemble score to control how many points are
+                # treated as anomalies.
+                sensitivity_mode = config.get('sensitivity_mode', 'Balanced (recommended)')
+                steps_all_prophet = config.get('steps_all_prophet', False)
+
+                if sensitivity_mode == 'catch more anomalies':
+                    # Any point flagged by at least one method is an anomaly
+                    base_is_anom = method_votes >= 1
+                elif sensitivity_mode == 'only strong anomalies':
+                    # Require agreement from multiple methods and a higher score
+                    base_is_anom = (method_votes >= 2) & (anomaly_scores >= config['medium_threshold'])
+                else:  # Balanced
+                    # At least one method plus a moderate score
+                    base_is_anom = (method_votes >= 1) & (anomaly_scores >= config['low_threshold'])
+
+                # Optionally: for Steps, always include any Prophet
+                # band breach as an anomaly so counts match the
+                # with/without-holidays views more closely.
+                if steps_all_prophet and "step" in metric_name.lower():
+                    df['is_anom'] = base_is_anom | prophet_band_hits
+                else:
+                    df['is_anom'] = base_is_anom
+
+                # Assign severity ONLY to flagged anomalies; others stay "Normal".
+                severity = np.full(len(df), 'Normal', dtype=object)
+                # Low severity: between low and medium thresholds
+                low_mask = df['is_anom'] & (anomaly_scores < config['medium_threshold'])
+                severity[low_mask] = 'Low'
+                # Medium severity: between medium and high thresholds
+                med_mask = df['is_anom'] & (anomaly_scores >= config['medium_threshold']) & (anomaly_scores < config['high_threshold'])
+                severity[med_mask] = 'Medium'
+                # High severity: above high threshold
+                high_mask = df['is_anom'] & (anomaly_scores >= config['high_threshold'])
+                severity[high_mask] = 'High'
+
                 df['severity'] = severity
-                df['is_anom'] = anomaly_scores >= config['low_threshold']
                 
                 # DISPLAY (OPTIMIZED - fewer but informative charts)
                 st.markdown(f"---\n## {metric_name}")
 
-                n_anom = df['is_anom'].sum()
-                n_high = (df['severity'] == 'High').sum()
-                n_med = (df['severity'] == 'Medium').sum()
-                n_low = (df['severity'] == 'Low').sum()
+                # Count only flagged anomalies per severity, and make
+                # Total Anomalies the sum of Low + Medium + High.
+                n_high = ((df['severity'] == 'High') & df['is_anom']).sum()
+                n_med = ((df['severity'] == 'Medium') & df['is_anom']).sum()
+                n_low = ((df['severity'] == 'Low') & df['is_anom']).sum()
+                n_anom = n_high + n_med + n_low
 
                 col1, col2, col3, col4 = st.columns(4)
                 col1.metric("Total Anomalies", n_anom)
@@ -1130,17 +1772,31 @@ with tabs[2]:
                                     max_val = by_weekday.max()
                                     min_val = by_weekday.min()
 
-                                    # Convert minutes to hours when values look like minutes
-                                    max_hours = max_val / 60.0
-                                    min_hours = min_val / 60.0
+                                    # Heuristic: if values are large (> 24), treat as minutes and
+                                    # convert to hours; otherwise assume they are already hours.
+                                    if max_val > 24:
+                                        max_hours = max_val / 60.0
+                                        min_hours = min_val / 60.0
+                                    else:
+                                        max_hours = max_val
+                                        min_hours = min_val
 
                                     extra_lines.append("Sleep weekday pattern (average):")
-                                    extra_lines.append(
-                                        f"- Most sleep on {max_wd} (~{max_hours:.1f} hours)."
-                                    )
-                                    extra_lines.append(
-                                        f"- Least sleep on {min_wd} (~{min_hours:.1f} hours)."
-                                    )
+
+                                    # If weekdays differ only slightly, avoid confusing
+                                    # "most" vs "least" lines with the same rounded value.
+                                    if abs(max_hours - min_hours) < 0.25:  # < 15 minutes difference
+                                        avg_hours = (max_hours + min_hours) / 2.0
+                                        extra_lines.append(
+                                            f"- Sleep duration is similar across weekdays (~{avg_hours:.1f} hours per night)."
+                                        )
+                                    else:
+                                        extra_lines.append(
+                                            f"- Most sleep on {max_wd} (~{max_hours:.1f} hours)."
+                                        )
+                                        extra_lines.append(
+                                            f"- Least sleep on {min_wd} (~{min_hours:.1f} hours)."
+                                        )
 
                                 # Simple trend: compare last 7 vs previous 7 days
                                 if len(daily_sleep) >= 14:
@@ -1240,8 +1896,17 @@ with tabs[2]:
                 # For steps data, always show precomputed forecasts with and without holidays
                 if "step" in metric_name.lower():
                     st.markdown("#### 📈 Steps Forecast: With vs Without Holidays")
-                    # Use full available range from module outputs (independent of upload window)
-                    render_steps_forecast_section(show_anomalies=True, show_events=True)
+                    # Use the same effective date window as anomaly detection,
+                    # if one was set from the Analysis tab; otherwise fall back
+                    # to the full available range from module outputs.
+                    cfg_start = config.get('start_date') if isinstance(config, dict) else None
+                    cfg_end = config.get('end_date') if isinstance(config, dict) else None
+                    render_steps_forecast_section(
+                        start_date=cfg_start,
+                        end_date=cfg_end,
+                        show_anomalies=True,
+                        show_events=True,
+                    )
                 
                 # Results Table
                 if n_anom > 0:
@@ -1261,399 +1926,433 @@ with tabs[3]:
     # File Upload Section
     col1, col2 = st.columns([2, 1])
     with col1:
-        st.markdown("**Upload Health Data**")
-        uploaded_file = st.file_uploader("Choose CSV file (preprocessed or raw)", type=["csv"], key="report_upload")
+        # 1) Choose whether to report on existing Analysis/Anomalies data
+        #    or on a newly uploaded file.
+        report_source_mode = st.radio(
+            "Select report source",
+            ["Report on analyzed data", "Report on uploaded file"],
+            index=0,
+            help=(
+                "Use the metrics you've already processed in the Analysis/Anomalies tabs, "
+                "or upload/select a CSV and let the report run its own analysis in the background."
+            ),
+        )
+
+        st.markdown("---")
+
+        # 2) Optional upload section (only used when reporting on an uploaded file)
+        st.markdown("**Upload file for report (optional)**")
+        uploaded_file = st.file_uploader(
+            "Choose CSV file (preprocessed or raw)",
+            type=["csv"],
+            key="report_upload",
+            help="Only used when 'Report on uploaded file' is selected above.",
+        )
+
+        # 3) Metric selection that applies **only** to the uploaded-file path
+        upload_metric_selection = []
+        if report_source_mode == "Report on uploaded file":
+            upload_metric_selection = st.multiselect(
+                "Select metric(s) for uploaded file",
+                ["Heart Rate", "Steps", "Sleep"],
+                default=["Heart Rate"],
+                help="These metric choices apply only when generating a report from an uploaded file.",
+            )
     
     with col2:
         st.markdown("**Report Settings**")
-        include_analysis = st.checkbox("Include Analysis", value=True)
-        include_anomalies = st.checkbox("Include Anomalies", value=True)
+
+        # Common settings: apply to both analyzed-data and uploaded-file reports
+        include_analysis = st.checkbox("Include Analysis section", value=True)
+        include_anomalies = st.checkbox("Include Anomalies section", value=True)
+
+    # Global action button to generate the report based on the
+    # selections above (source + settings).
+    st.markdown("---")
+    generate_report_clicked = st.button(
+        "Generate Report", use_container_width=True, key="gen_comprehensive_report"
+    )
     
-    if uploaded_file:
-        try:
-            df = pd.read_csv(uploaded_file)
-            df.columns = df.columns.str.lower().str.strip()
-            
-            # Auto-detect columns
-            date_col = None
-            value_col = None
-            
-            for col in ['ds', 'timestamp', 'date', 'time', 'datetime']:
-                if col in df.columns:
-                    date_col = col
-                    break
-            
-            for col in ['y', 'value', 'metric', 'val', 'heart_rate', 'steps', 'sleep_hours', 'hr']:
-                if col in df.columns:
-                    value_col = col
-                    break
-            
-            if date_col and value_col:
-                df['date'] = pd.to_datetime(df[date_col], errors='coerce')
-                df['value'] = pd.to_numeric(df[value_col], errors='coerce')
-                df = df.dropna(subset=['date', 'value']).sort_values('date')
-                
-                # Detect metric type
-                filename = uploaded_file.name.lower()
-                if 'heart' in filename or 'hr' in filename:
-                    metric_type = "Heart Rate"
-                    unit = "bpm"
-                elif 'step' in filename:
-                    metric_type = "Steps"
-                    unit = "steps"
-                elif 'sleep' in filename:
-                    metric_type = "Sleep"
-                    unit = "hours"
+    df = None
+    filename = None
+    source_mode = None  # 'csv' or 'dashboard'
+    dashboard_metric_key = None
+    dashboard_metrics_for_report = []
+    analysis_data = st.session_state.get("analysis_user_data", {})
+    anom_data = st.session_state.get("anom_data", {})
+
+    # Build the base dataframe depending on the chosen report source
+    if report_source_mode == "Report on uploaded file":
+        source_mode = "csv"
+
+        if uploaded_file:
+            try:
+                df = pd.read_csv(uploaded_file)
+                filename = uploaded_file.name
+            except Exception as e:
+                st.error(f"Error processing file: {str(e)}")
+                df = None
+
+    else:  # Report on analyzed data from Analysis/Anomalies tabs
+        source_mode = "dashboard"
+        if not analysis_data:
+            st.error(
+                "No processed data found from the Analysis tab. "
+                "Please upload and run Analysis first, or switch to 'Report on uploaded file'."
+            )
+        else:
+            # Metrics selected in Analysis tab (for Analysis Overview section)
+            analysis_selected = st.session_state.get("analysis_selected_metrics", [])
+            if analysis_selected:
+                analysis_metrics_for_report = [m for m in analysis_selected if m in analysis_data]
+            else:
+                analysis_metrics_for_report = list(analysis_data.keys())
+
+            # Metrics selected in Anomalies tab (for Anomalies section)
+            if anom_data:
+                anom_selected = st.session_state.get("anom_selected_metrics", list(anom_data.keys()))
+                anomaly_metrics_for_report = [m for m in anom_selected if m in analysis_data]
+            else:
+                anomaly_metrics_for_report = []
+
+            # Union of all metrics we might talk about
+            dashboard_metrics_for_report = list({*analysis_metrics_for_report, *anomaly_metrics_for_report})
+
+            if not dashboard_metrics_for_report:
+                st.error(
+                    "No metrics found from previous tabs. "
+                    "Please run Analysis (and optionally Anomalies) first."
+                )
+            else:
+                # Deterministic choice for column detection / filename
+                dashboard_metric_key = dashboard_metrics_for_report[0]
+
+            if dashboard_metric_key and dashboard_metric_key in analysis_data:
+                df_metric = analysis_data[dashboard_metric_key].copy()
+                if "ds" in df_metric.columns and "y" in df_metric.columns:
+                    df = df_metric.rename(columns={"ds": "date", "y": "value"})
+                    filename = f"{dashboard_metric_key.replace(' ', '')}_from_dashboard"
                 else:
-                    metric_type = "Health Metric"
-                    unit = "units"
-                
-                # Calculate statistics
-                mean_val = df['value'].mean()
-                median_val = df['value'].median()
-                std_val = df['value'].std()
-                min_val = df['value'].min()
-                max_val = df['value'].max()
-                
-                # Anomaly detection
-                outliers = (df['value'] < mean_val - 2.5 * std_val) | (df['value'] > mean_val + 2.5 * std_val)
-                anomaly_indices = np.where(outliers)[0]
-                anomaly_count = len(anomaly_indices)
-                
-                recent_trend = df['value'].iloc[-7:].mean() - df['value'].iloc[-14:-7].mean() if len(df) >= 14 else 0
-                
-                if st.button("Generate Report", use_container_width=True, key="gen_comprehensive_report"):
-                    with st.spinner("Generating comprehensive report..."):
-                        try:
-                            # Generate comprehensive report text
-                            report_text = f"""
-FitPlus Health Report - {metric_type}
+                    st.error(
+                        f"{dashboard_metric_key}: expected columns 'ds' and 'y' in Analysis data. "
+                        "Please re-run Analysis for this metric."
+                    )
+            elif dashboard_metric_key:
+                st.error(
+                    f"No data available for {dashboard_metric_key} from Analysis tab. "
+                    "Please enable this metric in Analysis or upload a CSV."
+                )
+
+    if df is not None:
+        try:
+            if source_mode == "csv":
+                # ----- Multi-metric path for uploaded CSV -----
+                if not upload_metric_selection:
+                    st.error("Please select at least one metric for the uploaded file.")
+                else:
+                    series_dict = extract_metric_time_series(df, filename=filename)
+                    if not series_dict:
+                        st.error(
+                            "Could not detect Heart Rate, Steps, or Sleep columns in the uploaded file. "
+                            "Please ensure the CSV contains recognizable metric columns."
+                        )
+                    elif generate_report_clicked:
+                        with st.spinner("Generating comprehensive report from uploaded file(s)..."):
+                            report_text = ""
+
+                            # ANALYSIS OVERVIEW
+                            if include_analysis:
+                                report_text += f"""
+FitPlus Health Report - Uploaded Data
 {'='*80}
 
 Report Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-Data Points: {len(df)}
-Date Range: {df['date'].min().strftime('%Y-%m-%d')} to {df['date'].max().strftime('%Y-%m-%d')}
+Source File: {filename}
 
 {'='*80}
 
 ANALYSIS OVERVIEW
------------------
-
-Your {metric_type.lower()} data shows the following health patterns:
-
-Key Statistics:
-  - Average: {mean_val:.2f} {unit}
-  - Median: {median_val:.2f} {unit}
-  - Standard Deviation: {std_val:.2f}
-  - Range: {min_val:.2f} - {max_val:.2f} {unit}
-  - 7-Day Trend: {'Increasing' if recent_trend > 0 else 'Decreasing'} ({abs(recent_trend):.2f} {unit})
+------------------
 
 """
-                            
-                            # Metric-specific analysis
-                            if "Heart" in metric_type:
-                                health_status = "Normal" if 60 <= mean_val <= 100 else "Elevated" if mean_val > 100 else "Low"
-                                emergency = mean_val > 120 or mean_val < 40
-                                
-                                report_text += f"""
-HEART RATE ANALYSIS
--------------------
 
-Health Status: {health_status}
+                                for m_key in upload_metric_selection:
+                                    metric_df = series_dict.get(m_key)
+                                    if metric_df is None or not isinstance(metric_df, pd.DataFrame):
+                                        continue
 
-Your average resting heart rate of {mean_val:.1f} bpm indicates a {health_status.lower()} 
-cardiovascular state. The medical standard for healthy resting heart rate in adults is 
-60-100 bpm.
+                                    if "ds" not in metric_df.columns or "y" not in metric_df.columns:
+                                        continue
 
-Pattern Analysis:
-  - Consistency Score: {100 - (std_val / mean_val * 100):.1f}%
-  - Your heart rate shows {'stable' if std_val < mean_val * 0.15 else 'variable'} patterns
-  - Recent trend: {'Improving cardiovascular fitness' if recent_trend < 0 else 'Increased stress or activity'}
+                                    df_m = metric_df.rename(columns={"ds": "date", "y": "value"}).copy()
+                                    df_m["date"] = pd.to_datetime(df_m["date"], errors="coerce")
+                                    df_m["value"] = pd.to_numeric(df_m["value"], errors="coerce")
+                                    df_m = df_m.dropna(subset=["date", "value"]).sort_values("date")
 
-CARDIOVASCULAR HEALTH REASONING:
-- Resting heart rate reflects cardiovascular fitness
-- Lower resting heart rate generally indicates better heart efficiency
-- Consistent patterns suggest stable health
-- Variability may indicate stress, activity changes, or health fluctuations
+                                    if df_m.empty:
+                                        continue
 
-"""
-                                if emergency:
-                                    report_text += f"""
-[EMERGENCY ALERT]
-Your heart rate readings show concerning values ({min_val:.0f}-{max_val:.0f} bpm).
-ACTION REQUIRED: Consult a healthcare provider immediately.
+                                    m_mean = df_m["value"].mean()
+                                    m_median = df_m["value"].median()
+                                    m_std = df_m["value"].std()
+                                    m_min = df_m["value"].min()
+                                    m_max = df_m["value"].max()
 
-"""
-                            
-                            elif "Step" in metric_type:
-                                daily_avg = mean_val
-                                activity_level = "Sedentary" if daily_avg < 5000 else "Low Active" if daily_avg < 7500 else "Somewhat Active" if daily_avg < 10000 else "Active" if daily_avg < 12500 else "Very Active"
-                                
-                                report_text += f"""
-DAILY ACTIVITY ANALYSIS
------------------------
+                                    m_recent_trend = (
+                                        df_m["value"].iloc[-7:].mean()
+                                        - df_m["value"].iloc[-14:-7].mean()
+                                        if len(df_m) >= 14
+                                        else 0
+                                    )
 
-Activity Level: {activity_level}
+                                    m_unit = metric_unit(m_key)
 
-Your average daily step count of {daily_avg:.0f} steps indicates a {activity_level.lower()} 
-lifestyle. The World Health Organization recommends 10,000 steps daily for optimal 
-health benefits.
+                                    report_text += format_metric_analysis_block(
+                                        m_key,
+                                        m_mean,
+                                        m_median,
+                                        m_std,
+                                        m_min,
+                                        m_max,
+                                        m_recent_trend,
+                                        m_unit,
+                                    )
 
-Pattern Analysis:
-  - Consistency Score: {100 - (std_val / max(mean_val, 1) * 100):.1f}%
-  - Activity patterns: {'Regular and consistent' if std_val < mean_val * 0.25 else 'Highly variable'}
-  - Recent trend: {'Increasing physical activity' if recent_trend > 0 else 'Declining activity levels'}
-
-ACTIVITY PATTERN REASONING:
-- Daily steps measure physical activity and lifestyle
-- Regular movement reduces disease risk and improves fitness
-- Consistency indicates sustainable habits
-- Variations may reflect work schedule, weather, or exercise routines
-
-"""
-                            
-                            elif "Sleep" in metric_type:
-                                sleep_quality = "Excellent" if 7 <= mean_val <= 9 else "Good" if 6 <= mean_val < 7 else "Poor" if mean_val < 6 else "Too Much"
-                                
-                                report_text += f"""
-SLEEP DURATION ANALYSIS
------------------------
-
-Sleep Quality Rating: {sleep_quality}
-
-Your average nightly sleep of {mean_val:.1f} hours is rated as {sleep_quality.lower()}. 
-The medical standard recommends 7-9 hours of quality sleep per night for adults.
-
-Pattern Analysis:
-  - Consistency Score: {100 - (std_val / mean_val * 100):.1f}%
-  - Sleep patterns: {'Very stable sleep schedule' if std_val < mean_val * 0.15 else 'Irregular sleep patterns'}
-  - Recent trend: {'Improving sleep duration' if recent_trend > 0 else 'Declining sleep hours'}
-
-SLEEP HEALTH REASONING:
-- Sleep duration directly affects immune function and cognitive performance
-- Consistent sleep schedule supports circadian rhythm
-- Irregular sleep may indicate stress, lifestyle changes, or sleep disorders
-- Quality and consistency matter as much as duration
-
-"""
-                            
-                            # Anomalies section
+                            # ANOMALIES SECTION for uploaded data
                             if include_anomalies:
                                 report_text += f"""
 {'='*80}
 
-ANOMALY DETECTION & ANALYSIS
------------------------------
-
-Anomalies Detected: {anomaly_count}
-Percentage of Data: {(anomaly_count/len(df)*100):.2f}%
+ANOMALIES OVERVIEW (Uploaded Data)
+----------------------------------
 
 """
-                                if anomaly_count > 0:
+
+                                for m_key in upload_metric_selection:
+                                    metric_df = series_dict.get(m_key)
+                                    if metric_df is None or not isinstance(metric_df, pd.DataFrame):
+                                        continue
+
+                                    if "ds" not in metric_df.columns or "y" not in metric_df.columns:
+                                        continue
+
+                                    df_m = normalize_metric_df(metric_df)
+
+                                    if df_m.empty:
+                                        continue
+
+                                    m_mean = df_m["value"].mean()
+                                    m_std = df_m["value"].std()
+
+                                    m_outliers = (
+                                        (df_m["value"] < m_mean - 2.5 * m_std)
+                                        | (df_m["value"] > m_mean + 2.5 * m_std)
+                                    )
+                                    m_anom_idx = np.where(m_outliers)[0]
+                                    m_anom_count = len(m_anom_idx)
+
+                                    m_unit = metric_unit(m_key)
+
                                     report_text += f"""
+Metric: {m_key}
+~~~~~~~~~~~~~~~
+
+Anomalies Detected: {m_anom_count}
+Percentage of Data: {(m_anom_count/len(df_m)*100):.2f}%
+
+"""
+                                    if m_anom_count > 0:
+                                        report_text += """
 Top Recent Anomalies:
 """
-                                    for i, idx in enumerate(reversed(anomaly_indices[-5:]), 1):
-                                        anom_date = df['date'].iloc[idx]
-                                        anom_val = df['value'].iloc[idx]
-                                        deviation = (anom_val - mean_val) / std_val
-                                        
-                                        report_text += f"""
+                                        for i, idx in enumerate(reversed(m_anom_idx[-5:]), 1):
+                                            anom_date = df_m["date"].iloc[idx]
+                                            anom_val = df_m["value"].iloc[idx]
+                                            deviation = (
+                                                (anom_val - m_mean) / m_std if m_std else 0
+                                            )
+
+                                            report_text += f"""
 {i}. Date: {anom_date.strftime('%Y-%m-%d')}
-   Value: {anom_val:.2f} {unit}
+   Value: {anom_val:.2f} {m_unit}
    Deviation: {deviation:.2f} std_dev from mean
 """
-                                    
-                                    # Why anomalies occurred
-                                    report_text += f"""
+                                    else:
+                                        report_text += """
+No significant anomalies detected. Patterns appear stable.
+"""
 
-WHY THESE ANOMALIES OCCURRED:
+                            # Recommendations & disclaimer (shared)
+                            report_text = append_recommendations_and_disclaimer(
+                                report_text,
+                                "Based on your uploaded metrics analysis and anomalies:",
+                            )
 
-Anomalies represent unusual values that deviate significantly from normal patterns.
-For {metric_type.lower()}, these could be caused by:
+                            # For uploaded multi-metric mode, use a generic filename label
+                            metric_type = "UploadedMetrics"
 
-For Heart Rate Anomalies:
-  - Stress or anxiety during measurement
-  - Physical exercise or recovery period
-  - Caffeine or medication effects
-  - Sleep quality issues
-  - Potential health concerns if persistent
+                            # Build and show the PDF
+                            build_and_show_pdf_report(report_text, metric_type)
 
-For Steps Anomalies:
-  - Rest days or illness
-  - Intense exercise days
-  - Travel or schedule changes
-  - Weather conditions
-  - Work-related changes in routine
+            else:
+                # ----- Dashboard-based multi-metric report (Analysis/Anomalies tabs) -----
+                if not dashboard_metrics_for_report:
+                    st.error(
+                        "No metrics available from Analysis/Anomalies to include in the report."
+                    )
+                elif generate_report_clicked:
+                    with st.spinner("Generating comprehensive report from analyzed data..."):
+                        report_text = ""
 
-For Sleep Anomalies:
-  - Work stress or deadline pressure
-  - Lifestyle changes or travel
-  - Health issues or illness
-  - Environmental changes
-  - Schedule disruptions
+                        # ANALYSIS OVERVIEW: metrics selected in Analysis tab
+                        analysis_selected = st.session_state.get("analysis_selected_metrics", [])
+                        if analysis_selected:
+                            analysis_metrics_for_report = [
+                                m for m in analysis_selected if m in analysis_data
+                            ]
+                        else:
+                            analysis_metrics_for_report = list(analysis_data.keys())
 
-WHAT CAN BE DONE:
-  1) Monitor Trends: Track if anomalies form a pattern or are isolated incidents
-  2) Investigate Causes: Correlate anomalies with activities, stress, diet
-  3) Preventive Actions: Address root causes (stress management, routine changes)
-  4) Seek Help: If anomalies persist, consult healthcare provider
-  5) Lifestyle Adjustments: Implement targeted improvements based on findings
+                        # ANOMALIES: metrics selected in Anomalies tab
+                        if anom_data:
+                            anom_selected = st.session_state.get(
+                                "anom_selected_metrics", list(anom_data.keys())
+                            )
+                            anomaly_metrics_for_report = [
+                                m for m in anom_selected if m in analysis_data
+                            ]
+                        else:
+                            anomaly_metrics_for_report = []
+
+                        if include_analysis and analysis_metrics_for_report:
+                            report_text += f"""
+FitPlus Health Report - Analyzed Data
+{'='*80}
+
+Report Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+{'='*80}
+
+ANALYSIS OVERVIEW (From Analysis Tab)
+-------------------------------------
 
 """
-                                else:
-                                    report_text += f"""
-No significant anomalies detected in your data. Your {metric_type.lower()} patterns 
-are stable and consistent within normal ranges.
-"""
-                            
-                            # Recommendations section
+
+                            for m_key in analysis_metrics_for_report:
+                                metric_df = analysis_data.get(m_key)
+                                if metric_df is None or not isinstance(metric_df, pd.DataFrame):
+                                    continue
+
+                                if "ds" not in metric_df.columns or "y" not in metric_df.columns:
+                                    continue
+
+                                df_m = normalize_metric_df(metric_df)
+
+                                if df_m.empty:
+                                    continue
+
+                                m_mean = df_m["value"].mean()
+                                m_median = df_m["value"].median()
+                                m_std = df_m["value"].std()
+                                m_min = df_m["value"].min()
+                                m_max = df_m["value"].max()
+
+                                m_recent_trend = (
+                                    df_m["value"].iloc[-7:].mean()
+                                    - df_m["value"].iloc[-14:-7].mean()
+                                    if len(df_m) >= 14
+                                    else 0
+                                )
+
+                                m_unit = metric_unit(m_key)
+
+                                report_text += format_metric_analysis_block(
+                                    m_key,
+                                    m_mean,
+                                    m_median,
+                                    m_std,
+                                    m_min,
+                                    m_max,
+                                    m_recent_trend,
+                                    m_unit,
+                                )
+
+                        # ANOMALIES SECTION (from Anomalies tab selections)
+                        if include_anomalies and anomaly_metrics_for_report:
                             report_text += f"""
 {'='*80}
 
-HEALTH RECOMMENDATIONS & ACTION PLAN
--------------------------------------
+ANOMALIES OVERVIEW (From Anomalies Tab)
+---------------------------------------
 
-Based on your {metric_type.lower()} analysis:
-
-1. IMMEDIATE ACTIONS:
-   - Continue monitoring your health metrics regularly
-   - Note any lifestyle changes that correlate with anomalies
-   - Maintain current positive patterns
-
-2. SHORT-TERM IMPROVEMENTS (1-2 weeks):
-   - Identify and document triggers for anomalies
-   - Adjust routines based on patterns identified
-   - Increase consistency in health habits
-
-3. LONG-TERM STRATEGY (1-3 months):
-   - Work toward optimal health targets
-   - Build sustainable habits
-   - Track improvement trends
-
-4. WHEN TO SEEK PROFESSIONAL HELP:
-   - If anomalies become frequent or severe
-   - If trends are consistently negative
-   - If you experience symptoms or feel unwell
-   - After emergency alerts or concerning readings
-
-PROFESSIONAL CONSULTATION:
-If you have concerns about your health metrics or the anomalies detected, 
-please consult with your healthcare provider for personalized medical advice.
-
-{'='*80}
-
-Report Disclaimer:
-This report is generated for informational and educational purposes only.
-It is not a substitute for professional medical diagnosis or treatment.
-Please consult with a qualified healthcare provider for medical concerns.
-
-Generated by: FitPlus Health Insights Dashboard
-Report Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 """
 
-                            # Create PDF with embedded graphs
-                            pdf = FPDF()
-                            pdf.set_auto_page_break(auto=True, margin=15)
-                            pdf.set_left_margin(20)
-                            pdf.set_right_margin(20)
-                            pdf.add_page()
-                            pdf.set_font("Arial", size=10)
-                            text_width = pdf.w - pdf.l_margin - pdf.r_margin
+                            for m_key in anomaly_metrics_for_report:
+                                metric_df = analysis_data.get(m_key)
+                                if metric_df is None or not isinstance(metric_df, pd.DataFrame):
+                                    continue
 
-                            # Comprehensive character sanitization function for FPDF compatibility
-                            def sanitize_for_pdf(text):
-                                """Remove all non-ASCII characters and Unicode symbols, replace with safe ASCII equivalents."""
-                                if not isinstance(text, str):
-                                    text = str(text)
+                                if "ds" not in metric_df.columns or "y" not in metric_df.columns:
+                                    continue
 
-                                replacements = {
-                                    'σ': 'std_dev', 'Σ': 'SIGMA', 'μ': 'mean',
-                                    '↑': '[UP]', '↓': '[DOWN]', '→': '[RIGHT]', '←': '[LEFT]',
-                                    '⚠️': '[ALERT]', '⚠': '[ALERT]', '✓': '[OK]', '✗': '[FAIL]',
-                                    '•': '-', '◆': '*', '○': 'o', '●': '*', '★': '*', '☆': '*',
-                                    '™': '(TM)', '©': '(C)', '®': '(R)',
-                                    '€': 'EUR', '£': 'GBP', '¥': 'YEN',
-                                    '°': ' deg', '±': ' +/- ', '×': 'x', '÷': '/',
-                                    '≈': ' approx ', '≠': ' != ', '≤': ' <= ', '≥': ' >= ',
-                                    '√': 'sqrt', '∞': 'inf', '∑': 'sum', '∫': 'integral',
-                                    '∆': 'DELTA', 'λ': 'lambda', 'π': 'pi', 'θ': 'theta',
-                                    'Δ': 'DELTA', 'Ω': 'OMEGA',
-                                    'α': 'alpha', 'β': 'beta', 'γ': 'gamma', 'δ': 'delta',
-                                    'ε': 'epsilon', 'ζ': 'zeta', 'η': 'eta', 'κ': 'kappa',
-                                    'ν': 'nu', 'ρ': 'rho', 'τ': 'tau', 'υ': 'upsilon',
-                                    'φ': 'phi', 'χ': 'chi', 'ψ': 'psi', 'ω': 'omega',
-                                    '–': '-', '—': '-', '‐': '-', '‑': '-', '−': '-',
-                                    '…': '...', '·': '.', '‰': '/1000',
-                                    '′': "'", '″': '"', '‴': "'''",
-                                    '‵': "'", '‶': '"',
-                                    'ʹ': "'", 'ʺ': '"', 'ʻ': "'", 'ʼ': "'", 'ʽ': "'", 'ʾ': "'", 'ʿ': "'",
-                                }
+                                df_m = normalize_metric_df(metric_df)
 
-                                result = text
-                                for unicode_char, replacement in replacements.items():
-                                    result = result.replace(unicode_char, replacement)
+                                if df_m.empty:
+                                    continue
 
-                                try:
-                                    result = result.encode('ascii', 'ignore').decode('ascii')
-                                except Exception:
-                                    result = ''.join(char if ord(char) < 128 else '?' for char in result)
+                                m_mean = df_m["value"].mean()
+                                m_std = df_m["value"].std()
 
-                                return result
+                                m_outliers = (
+                                    (df_m["value"] < m_mean - 2.5 * m_std)
+                                    | (df_m["value"] > m_mean + 2.5 * m_std)
+                                )
+                                m_anom_idx = np.where(m_outliers)[0]
+                                m_anom_count = len(m_anom_idx)
 
-                            # Add text to PDF with proper encoding and width handling
-                            for line in report_text.split('\n'):
-                                if line.strip():
-                                    clean_line = sanitize_for_pdf(line)
-                                    if clean_line.strip():
-                                        pdf.multi_cell(text_width, 5, clean_line, align='L')
+                                m_unit = metric_unit(m_key)
+
+                                report_text += f"""
+Metric: {m_key}
+~~~~~~~~~~~~~~~
+
+Anomalies Detected: {m_anom_count}
+Percentage of Data: {(m_anom_count/len(df_m)*100):.2f}%
+
+"""
+                                if m_anom_count > 0:
+                                    report_text += """
+Top Recent Anomalies:
+"""
+                                    for i, idx in enumerate(reversed(m_anom_idx[-5:]), 1):
+                                        anom_date = df_m["date"].iloc[idx]
+                                        anom_val = df_m["value"].iloc[idx]
+                                        deviation = (
+                                            (anom_val - m_mean) / m_std if m_std else 0
+                                        )
+
+                                        report_text += f"""
+{i}. Date: {anom_date.strftime('%Y-%m-%d')}
+   Value: {anom_val:.2f} {m_unit}
+   Deviation: {deviation:.2f} std_dev from mean
+"""
                                 else:
-                                    pdf.ln(2)
+                                    report_text += """
+No significant anomalies detected. Patterns appear stable.
+"""
 
-                            # Save PDF to disk
-                            pdf_filename = f"HealthReport_{metric_type.replace(' ', '')}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
-                            pdf.output(pdf_filename)
+                        # Shared recommendations & disclaimer for dashboard mode
+                        report_text = append_recommendations_and_disclaimer(
+                            report_text,
+                            "Based on your analyzed metrics and anomalies:",
+                        )
 
-                            # Read PDF bytes once
-                            with open(pdf_filename, "rb") as f:
-                                pdf_bytes = f.read()
+                        # For dashboard multi-metric mode, use a generic label
+                        metric_type = "AnalyzedMetrics"
 
-                            # Display success and download button
-                            st.success("✓ Report generated successfully!")
-                            st.markdown("---")
+                        # Build and show the PDF
+                        build_and_show_pdf_report(report_text, metric_type)
 
-                            st.download_button(
-                                "📥 Download PDF Report",
-                                data=pdf_bytes,
-                                file_name=pdf_filename,
-                                mime="application/pdf",
-                                use_container_width=True,
-                            )
-
-                            # Inline PDF preview (centered, like a printed page)
-                            st.markdown("### Report Preview")
-                            base64_pdf = base64.b64encode(pdf_bytes).decode("utf-8")
-                            pdf_display = f'''
-                            <div style="display:flex; justify-content:center;">
-                              <iframe
-                                src="data:application/pdf;base64,{base64_pdf}"
-                                style="width:100%; max-width:900px; height:800px; border:1px solid #ccc; box-shadow:0 0 8px rgba(0,0,0,0.1);"
-                                type="application/pdf">
-                              </iframe>
-                            </div>
-                            '''
-                            st.markdown(pdf_display, unsafe_allow_html=True)
-                        
-                        except Exception as e:
-                            st.error(f"Error generating report: {str(e)}")
-                
-                # Show data preview
-                if st.checkbox("Show data preview", value=False):
-                    st.dataframe(df[['date', 'value']].head(20), use_container_width=True)
-            
-            else:
-                st.error("Could not auto-detect date and value columns. Please ensure CSV has standard column names like 'ds', 'date', 'y', 'value'.")
-        
         except Exception as e:
             st.error(f"Error processing file: {str(e)}")
                 

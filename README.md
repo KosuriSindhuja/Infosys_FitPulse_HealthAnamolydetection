@@ -95,10 +95,13 @@ Interactive daily health summary:
 - 7-day sparkline charts
 
 ### Tab 2: Analysis
-Interactive health data exploration:
-- **Date Range Selection**: Calendar picker with "Analyze All Data" toggle
-- **Metric Selection**: Choose Heart Rate, Steps, Sleep
-- **Visualizations**:
+Interactive health data exploration driven entirely by **user-uploaded CSVs**:
+- **Flexible Uploads**: Accepts up to 6 raw or processed CSVs (including train/test, preprocessed_data, raw Fitbit exports)
+- **Automatic Metric Detection**:
+  - Detects date/time columns (ds, timestamp, date, datetime, activityDate, logDate, sleepDate, etc.)
+  - Extracts daily series for **Heart Rate**, **Steps**, and **Sleep** based on column names (heart_rate, heartrate, hr, bpm, steps, step_count, sleep_hours, minutesAsleep, etc.)
+- **Metric Selection**: User chooses which metric(s) to analyze; if a selected metric is **not present** in the uploaded data, the dashboard clearly reports that it is missing instead of failing
+- **Visualizations** (per selected metric):
   - Time Series: Line chart with markers
   - Scatter Plot: Value distribution
   - Prophet Trend: Trend decomposition
@@ -106,13 +109,20 @@ Interactive health data exploration:
 - **Summary Statistics**: Mean, median, std dev, min, max, range
 
 ### Tab 3: Anomalies
-Advanced multi-method anomaly detection supporting **both raw and processed CSV files**:
+Advanced multi-method anomaly detection supporting **both raw and processed CSV files**, including files that contain
+multiple metrics (heart rate, steps, sleep) together and reusing data already uploaded in the Analysis tab:
 
 #### Features:
-- **Smart Column Detection** 
-  - Auto-detects date columns: ds, timestamp, date, datetime, activityDate, logDate, sleepDate
-  - Auto-detects value columns: y, value, heart_rate, heartrate, steps, step_count, sleep_hours, duration, duration_minutes, hr, bpm, count
-  - Supports both processed files (ds, y format) and raw FitBit files
+- **Shared Data Source with Analysis Tab**
+  - Uses the same uploaded CSV files and extracted daily series as the Analysis tab
+  - User simply selects which metrics (Heart Rate, Steps, Sleep) to run anomaly detection on; if a selected metric has no data,
+    the dashboard clearly reports that instead of failing
+- **Smart Multi-Metric Detection** 
+  - Auto-detects date columns: ds, timestamp, date, datetime, activityDate, logDate, sleepDate, etc.
+  - From each uploaded CSV, automatically extracts separate daily series for **Heart Rate**, **Steps**, and **Sleep** when
+    those columns are present (e.g., heart_rate, steps, sleep_hours, minutesAsleep), so a single uploaded file can yield multiple
+    anomaly traces
+  - Also supports legacy processed files in ds/y format with metric inferred from filename
 - **Performance Optimization**
   - Automatic sampling for large files (>10,000 rows) to prevent hanging
   - Efficient vectorized anomaly detection
@@ -188,7 +198,7 @@ km = KMeans(n_clusters=..., n_init=5)  # reduced from 10 for speed
 **Professional theory-based PDF reports from CSV data**
 
 #### Features:
-✅ CSV upload (preprocessed or raw format)  
+✅ CSV upload (preprocessed or raw format), or reuse of files already uploaded in the Analysis tab  
 ✅ Auto-detect columns and metric type  
 ✅ Comprehensive statistical analysis  
 ✅ Multi-method anomaly detection  
@@ -197,7 +207,7 @@ km = KMeans(n_clusters=..., n_init=5)  # reduced from 10 for speed
 
 #### Workflow:
 ```
-1. Upload CSV Data
+1. Upload CSV Data (in the Reports tab or in the Analysis tab)
    ↓
 2. Auto-detect Columns & Metric Type
    ↓

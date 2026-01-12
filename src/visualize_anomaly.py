@@ -526,8 +526,6 @@ class AnomalyVisualizer:
     def _apply_layout_template(self, fig: go.Figure, dark_mode: bool):
         template = 'plotly_dark' if dark_mode else 'plotly_white'
         fig.update_layout(template=template)
-
-    # ===== ENSEMBLE VISUALIZATION METHODS (MILESTONE 3) =====
     
     def plot_ensemble_heart_rate(self, df: pd.DataFrame, title: str = 'Heart Rate - Ensemble Anomaly Detection', dark_mode: bool = False) -> go.Figure:
         """
