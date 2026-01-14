@@ -42,6 +42,15 @@ st.sidebar.markdown(
     unsafe_allow_html=True,
 )
 
+st.sidebar.markdown(
+    """
+    <p style="font-size:0.8rem; color:#d0d8e5; margin-bottom:0.2rem;">
+        An anomaly is a health reading that looks different from your normal pattern and may need a closer look.
+    </p>
+    """,
+    unsafe_allow_html=True,
+)
+
 st.sidebar.title("Navigation")
 
 # Add tab descriptions
@@ -1420,15 +1429,9 @@ with tabs[2]:
             ),
         )
 
-        # Optional: for Steps, always flag any Prophet band breach
-        steps_all_prophet = st.checkbox(
-            "For Steps, treat every forecast band breach as an anomaly",
-            value=True,
-            help=(
-                "When enabled, any day where actual steps fall outside the Prophet forecast band "
-                "will be marked as an anomaly, so counts more closely match the with/without-holidays plots."
-            ),
-        )
+        # Backend rule: for Steps, always treat any Prophet
+        # forecast band breach as an anomaly (no user toggle).
+        steps_all_prophet = True
 
         # Map sensitivity choice to internal numeric thresholds for Low / Medium / High severity
         if sensitivity_choice == "catch more anomalies":
@@ -1490,7 +1493,10 @@ with tabs[2]:
                             'medium_threshold': medium_threshold,
                             'high_threshold': high_threshold,
                             'sensitivity_mode': sensitivity_choice,
-                            'steps_all_prophet': steps_all_prophet,
+                            # This behaviour is now compulsory in the backend:
+                            # any Prophet band breach for Steps is always treated
+                            # as an anomaly.
+                            'steps_all_prophet': True,
                             # Persist the effective date window for use when
                             # rendering forecasts (e.g., steps with/without holidays).
                             'start_date': start_date,
@@ -1655,7 +1661,9 @@ with tabs[2]:
                 # ensemble score to control how many points are
                 # treated as anomalies.
                 sensitivity_mode = config.get('sensitivity_mode', 'Balanced (recommended)')
-                steps_all_prophet = config.get('steps_all_prophet', False)
+                # Force Steps to always treat Prophet band breaches
+                # as anomalies (no longer user-configurable).
+                steps_all_prophet = True
 
                 if sensitivity_mode == 'catch more anomalies':
                     # Any point flagged by at least one method is an anomaly
