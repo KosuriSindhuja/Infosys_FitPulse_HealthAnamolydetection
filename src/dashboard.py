@@ -1,6 +1,7 @@
 import os
 import base64
 from datetime import datetime, timedelta, date
+from typing import Optional
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -616,47 +617,103 @@ def load_steps_forecast_data():
     return data
 
 
-def render_steps_forecast_section(start_date=None, end_date=None, show_anomalies=True, show_events=True):
+def render_steps_forecast_section(
+    steps_df: pd.DataFrame,
+    anom_mask: Optional[pd.Series] = None,
+    anom_text: Optional[pd.Series] = None,
+    show_anomalies: bool = True,
+    show_events: bool = True,
+):
     """Render two graphs for steps: forecasts with and without holidays.
 
-    Uses precomputed module2_outputs forecasts and the daily_steps actuals.
-    If ``show_anomalies`` is False, the graphs will only show actuals,
-    forecasts and confidence bands (no red anomaly markers or event points).
+    This version always uses the provided ``steps_df`` (uploaded / selected
+    data) instead of precomputed Module 2 CSVs. When ``anom_mask`` is
+    provided, the same anomaly flags used in the Anomalies tab are shown
+    on both graphs, so changing severity or sensitivity updates all
+    three views consistently.
     """
-    data = load_steps_forecast_data()
-
-    steps_df = data.get("actual")
-    df_no = data.get("without_holidays")
-    df_with = data.get("with_holidays")
-    df_events = data.get("events")
-
-    if steps_df is None or df_no is None or df_with is None:
-        st.info("Steps forecast data (with/without holidays) is not available.")
+    if steps_df is None or steps_df.empty:
+        st.info("No steps data available for forecast comparison.")
         return
 
-    # Optional date filtering
-    if start_date is not None and end_date is not None:
-        mask_actual = (steps_df["ds"].dt.date >= start_date) & (steps_df["ds"].dt.date <= end_date)
-        mask_no = (df_no["ds"].dt.date >= start_date) & (df_no["ds"].dt.date <= end_date)
-        mask_with = (df_with["ds"].dt.date >= start_date) & (df_with["ds"].dt.date <= end_date)
-        steps_df = steps_df.loc[mask_actual]
-        df_no = df_no.loc[mask_no]
-        df_with = df_with.loc[mask_with]
+    work = steps_df.copy()
+    if "ds" not in work.columns or "y" not in work.columns:
+        st.warning("Steps data must have 'ds' and 'y' columns for forecasting.")
+        return
 
-        if steps_df.empty or df_no.empty or df_with.empty:
-            st.warning("No steps forecast data in the selected date range.")
-            return
+    work["ds"] = pd.to_datetime(work["ds"], errors="coerce")
+    work["y"] = pd.to_numeric(work["y"], errors="coerce")
+    work = work.dropna(subset=["ds", "y"]).sort_values("ds")
+    if work.empty:
+        st.info("No valid steps data available after cleaning.")
+        return
 
-    # Merge actuals with forecasts (inner join on ds to keep aligned days)
+    # Prepare base daily series
+    base = work[["ds", "y"]].rename(columns={"ds": "ds", "y": "y"})
+
+    # Fit Prophet model without holidays
+    try:
+        model_no = Prophet(
+            interval_width=0.95,
+            yearly_seasonality=len(base) > 365,
+            weekly_seasonality=True,
+            daily_seasonality=False,
+        )
+        model_no.fit(base)
+        fcst_no = model_no.predict(base[["ds"]])
+    except Exception as e:
+        st.warning(f"Could not fit steps forecast model: {e}")
+        return
+
+    # Construct a simple synthetic holiday calendar similar to Module 2
+    unique_days = base["ds"].dt.floor("D").sort_values().unique()
+    holidays_df = None
+    if len(unique_days) > 0:
+        start_day = pd.to_datetime(unique_days[0])
+
+        def date_for_day(one_indexed: int) -> pd.Timestamp:
+            return start_day + pd.Timedelta(days=one_indexed - 1)
+
+        holiday_rows = []
+        # Vacation block around day 30
+        for d in range(30, 38):
+            holiday_rows.append({"holiday": "vacation", "ds": date_for_day(d)})
+        # Sick days around day 60
+        for d in [60, 61, 62]:
+            holiday_rows.append({"holiday": "sick", "ds": date_for_day(d)})
+        # Marathon day at day 90
+        holiday_rows.append({"holiday": "marathon", "ds": date_for_day(90)})
+
+        holidays_df = pd.DataFrame(holiday_rows)
+        holidays_df["ds"] = pd.to_datetime(holidays_df["ds"], errors="coerce")
+
+    # Fit Prophet model with holidays (if we could build a calendar)
+    if holidays_df is not None and not holidays_df.empty:
+        try:
+            model_yes = Prophet(
+                interval_width=0.95,
+                yearly_seasonality=len(base) > 365,
+                weekly_seasonality=True,
+                daily_seasonality=False,
+                holidays=holidays_df,
+            )
+            model_yes.fit(base)
+            fcst_yes = model_yes.predict(base[["ds"]])
+        except Exception:
+            fcst_yes = fcst_no.copy()
+    else:
+        fcst_yes = fcst_no.copy()
+
+    # Keep forecasts aligned to actual days only
     merged_no = pd.merge(
-        steps_df[["ds", "y"]],
-        df_no[["ds", "yhat", "yhat_lower", "yhat_upper"]],
+        base,
+        fcst_no[["ds", "yhat", "yhat_lower", "yhat_upper"]],
         on="ds",
         how="inner",
     )
     merged_with = pd.merge(
-        steps_df[["ds", "y"]],
-        df_with[["ds", "yhat", "yhat_lower", "yhat_upper"]],
+        base,
+        fcst_yes[["ds", "yhat", "yhat_lower", "yhat_upper"]],
         on="ds",
         how="inner",
     )
@@ -665,9 +722,21 @@ def render_steps_forecast_section(start_date=None, end_date=None, show_anomalies
         st.warning("Aligned steps forecast data could not be prepared.")
         return
 
-    # Identify anomalies based on forecast confidence intervals
-    merged_no["is_anom"] = (merged_no["y"] > merged_no["yhat_upper"]) | (merged_no["y"] < merged_no["yhat_lower"])
-    merged_with["is_anom"] = (merged_with["y"] > merged_with["yhat_upper"]) | (merged_with["y"] < merged_with["yhat_lower"])
+    # Use ensemble anomaly flags from the caller when provided
+    if anom_mask is not None and len(anom_mask) == len(work):
+        merged_no["is_anom"] = anom_mask.values
+        merged_with["is_anom"] = anom_mask.values
+        if anom_text is not None and len(anom_text) == len(work):
+            merged_no["anom_text"] = anom_text.values
+            merged_with["anom_text"] = anom_text.values
+        else:
+            merged_no["anom_text"] = "Flagged anomaly"
+            merged_with["anom_text"] = "Flagged anomaly"
+    else:
+        merged_no["is_anom"] = False
+        merged_no["anom_text"] = ""
+        merged_with["is_anom"] = False
+        merged_with["anom_text"] = ""
 
     col_a, col_b = st.columns(2)
 
@@ -707,7 +776,7 @@ def render_steps_forecast_section(start_date=None, end_date=None, show_anomalies
             )
         )
 
-        # Anomaly markers (optional)
+        # Anomaly markers (optional, driven by ensemble flags when available)
         if show_anomalies:
             anom_no = merged_no[merged_no["is_anom"]]
             if not anom_no.empty:
@@ -716,8 +785,10 @@ def render_steps_forecast_section(start_date=None, end_date=None, show_anomalies
                         x=anom_no["ds"],
                         y=anom_no["y"],
                         mode="markers",
-                        name="Anomalies (No Holidays)",
+                        name="Anomalies",
                         marker=dict(size=8, color="red", symbol="x"),
+                        text=anom_no["anom_text"],
+                        hovertemplate="%{x|%Y-%m-%d}<br>Steps: %{y:.0f}<br>%{text}<extra></extra>",
                     )
                 )
 
@@ -766,7 +837,7 @@ def render_steps_forecast_section(start_date=None, end_date=None, show_anomalies
             )
         )
 
-        # Anomaly markers based on with-holiday forecast (optional)
+        # Anomaly markers based on ensemble flags (optional)
         if show_anomalies:
             anom_with = merged_with[merged_with["is_anom"]]
             if not anom_with.empty:
@@ -775,26 +846,42 @@ def render_steps_forecast_section(start_date=None, end_date=None, show_anomalies
                         x=anom_with["ds"],
                         y=anom_with["y"],
                         mode="markers",
-                        name="Anomalies (With Holidays)",
+                        name="Anomalies",
                         marker=dict(size=8, color="red", symbol="x"),
+                        text=anom_with["anom_text"],
+                        hovertemplate="%{x|%Y-%m-%d}<br>Steps: %{y:.0f}<br>%{text}<extra></extra>",
                     )
                 )
 
         # Highlight specific holiday / event days if available (optional)
-        if show_events and df_events is not None and not df_events.empty:
-            events_merged = pd.merge(df_events[["ds", "event"]], merged_with[["ds", "yhat"]], on="ds", how="inner")
-            if not events_merged.empty:
-                fig_with.add_trace(
-                    go.Scatter(
-                        x=events_merged["ds"],
-                        y=events_merged["yhat"],
-                        mode="markers",
-                        name="Holiday / Event Days",
-                        marker=dict(size=9, color="orange", symbol="diamond"),
-                        text=events_merged["event"],
-                        hovertemplate="%{x|%Y-%m-%d}<br>Event: %{text}<br>Forecast: %{y:.0f} steps<extra></extra>",
-                    )
-                )
+        if show_events:
+            events_path = os.path.join(MODULE2_DIR, "task3_events_impact.csv")
+            if os.path.exists(events_path):
+                try:
+                    df_events = pd.read_csv(events_path)
+                    if "ds" in df_events.columns and "event" in df_events.columns:
+                        df_events["ds"] = pd.to_datetime(df_events["ds"], errors="coerce")
+                        df_events = df_events.dropna(subset=["ds"]).sort_values("ds")
+                        events_merged = pd.merge(
+                            df_events[["ds", "event"]],
+                            fcst_yes[["ds", "yhat"]],
+                            on="ds",
+                            how="inner",
+                        )
+                        if not events_merged.empty:
+                            fig_with.add_trace(
+                                go.Scatter(
+                                    x=events_merged["ds"],
+                                    y=events_merged["yhat"],
+                                    mode="markers",
+                                    name="Holiday / Event Days",
+                                    marker=dict(size=9, color="orange", symbol="diamond"),
+                                    text=events_merged["event"],
+                                    hovertemplate="%{x|%Y-%m-%d}<br>Event: %{text}<br>Forecast: %{y:.0f} steps<extra></extra>",
+                                )
+                            )
+                except Exception:
+                    pass
 
         fig_with.update_layout(
             xaxis_title="Date",
@@ -828,6 +915,9 @@ with tabs[0]:
         f"<h2 style='font-size:2.5em; color:#2e86de; margin-bottom:0.2em;'>{greeting}</h2>",
         unsafe_allow_html=True,
     )
+
+    # Simple human-friendly summary for the Home tab
+    st.caption("This page gives you a quick view of today and the last week so you can spot any unusual heart, steps, or sleep days at a glance.")
 
     # Derive a compact health status
     uploaded_series = st.session_state.get("analysis_user_data", {})
@@ -1031,6 +1121,9 @@ with tabs[0]:
 # -----------------------------
 with tabs[1]:
     st.subheader("📊 Health Data Analysis")
+
+    # Simple human-friendly summary for the Analysis tab
+    st.caption("Use this page to explore how your heart, steps, and sleep change over time for any date range you choose.")
 
     # User-provided metric files (required for a user-centric deployment)
     st.markdown("**📁 Upload Health CSV Files**")
@@ -1343,10 +1436,12 @@ with tabs[1]:
                     # Additional forecast comparison specifically for Steps
                     if metric == "Steps":
                         st.markdown("### 📈 Steps Forecast: With vs Without Holidays")
-                        # In Analysis we show clean forecasts (no anomaly markers)
+                        # In Analysis we show clean forecasts (no anomaly markers),
+                        # but always based on the same uploaded steps series
                         render_steps_forecast_section(
-                            start_date=start_date,
-                            end_date=end_date,
+                            steps_df=df_range,
+                            anom_mask=None,
+                            anom_text=None,
                             show_anomalies=False,
                             show_events=False,
                         )
@@ -1376,6 +1471,9 @@ with tabs[1]:
 ## ===== ANOMALY DETECTION TAB (Advanced Multi-Method Ensemble) =====
 with tabs[2]:
     st.subheader("🔍 Advanced Anomaly Detection")
+
+    # Simple human-friendly summary for the Anomalies tab
+    st.caption("This page highlights days that look very different from your usual pattern so you know when to pay closer attention.")
 
     # Use the same date-range logic as the Analysis tab, if available.
     # If the user checked "Analyze All Data" there, we mirror that here.
@@ -1558,12 +1656,17 @@ with tabs[2]:
             # Track Prophet band breaches explicitly so we can
             # always include them for Steps if the user chooses.
             prophet_band_hits = np.zeros(len(df), dtype=bool)
+            # Collect textual reasons for each potential anomaly
+            reason_flags = [[] for _ in range(len(df))]
 
             # Point anomalies (fast, vectorized)
             outliers = (df['y'] < mean_val - 2.5 * std_val) | (df['y'] > mean_val + 2.5 * std_val)
             anomaly_scores[outliers] += 0.4
             anomaly_types[outliers] = 'Point'
             method_votes[outliers] += 1
+            outlier_idx = np.where(outliers)[0]
+            for i in outlier_idx:
+                reason_flags[i].append("Unusually high or low compared with your typical values.")
 
             # Contextual anomalies (fast, vectorized)
             changes = np.abs(df['y'].diff()).fillna(0)
@@ -1571,6 +1674,16 @@ with tabs[2]:
             anomaly_scores[spikes] += 0.3
             anomaly_types[spikes] = 'Contextual'
             method_votes[spikes] += 1
+            spike_idx = np.where(spikes)[0]
+            for i in spike_idx:
+                if i == 0 or pd.isna(df['y'].iloc[i - 1]):
+                    desc = "Sudden change compared with earlier days."
+                else:
+                    if df['y'].iloc[i] > df['y'].iloc[i - 1]:
+                        desc = "Sudden jump up compared with the previous day."
+                    else:
+                        desc = "Sudden drop compared with the previous day."
+                reason_flags[i].append(desc)
 
             # Prophet (once, cached via session) - OPTIMIZED for large data
             if len(df) >= 20:
@@ -1614,6 +1727,9 @@ with tabs[2]:
                     anomaly_scores[model_anom] += 0.4
                     method_votes[model_anom] += 1
                     prophet_band_hits = model_anom
+                    prophet_idx = np.where(model_anom)[0]
+                    for i in prophet_idx:
+                        reason_flags[i].append("Outside the forecast range predicted from your past data.")
                 except Exception:
                     # If Prophet fails for any reason, just skip model-based anomalies
                     pass
@@ -1638,12 +1754,18 @@ with tabs[2]:
                     anomaly_scores[kmeans_anom] += 0.3
                     anomaly_types[kmeans_anom] = 'Collective'
                     method_votes[kmeans_anom] += 1
+                    kmeans_idx = np.where(kmeans_anom)[0]
+                    for i in kmeans_idx:
+                        reason_flags[i].append("Unusual pattern compared with your typical days.")
                     
                     db = DBSCAN(eps=0.5, min_samples=3)
                     dbscan_anom = db.fit_predict(X) == -1
                     anomaly_scores[dbscan_anom] += 0.4
                     anomaly_types[dbscan_anom] = 'Collective'
                     method_votes[dbscan_anom] += 1
+                    dbscan_idx = np.where(dbscan_anom)[0]
+                    for i in dbscan_idx:
+                        reason_flags[i].append("Isolated behaviour that does not fit nearby days.")
                 except:
                     pass
 
@@ -1696,6 +1818,26 @@ with tabs[2]:
                 severity[high_mask] = 'High'
 
                 df['severity'] = severity
+
+                # Build a human-readable explanation per point for hover tooltips
+                explanations = []
+                for i in range(len(df)):
+                    if not df['is_anom'].iloc[i]:
+                        explanations.append("Not flagged as an anomaly.")
+                    else:
+                        parts = reason_flags[i] if reason_flags[i] else ["Flagged by the anomaly detection ensemble."]
+                        # Remove duplicates while preserving order
+                        seen = set()
+                        clean_parts = []
+                        for p in parts:
+                            if p not in seen:
+                                clean_parts.append(p)
+                                seen.add(p)
+                        reason_text = "; ".join(clean_parts)
+                        sev = df['severity'].iloc[i]
+                        explanations.append(f"{reason_text} (Severity: {sev}).")
+
+                df['anomaly_explanation'] = explanations
                 
                 # DISPLAY (OPTIMIZED - fewer but informative charts)
                 st.markdown(f"---\n## {metric_name}")
@@ -1849,8 +1991,15 @@ with tabs[2]:
                     for sev, col in [('High','red'), ('Medium','orange'), ('Low','yellow')]:
                         anom = df[(df['is_anom']) & (df['severity']==sev)]
                         if len(anom) > 0:
-                            fig.add_trace(go.Scatter(x=anom['ds'], y=anom['y'], mode='markers', name=sev,
-                                marker=dict(size=6, color=col, symbol='diamond')))
+                            fig.add_trace(go.Scatter(
+                                x=anom['ds'],
+                                y=anom['y'],
+                                mode='markers',
+                                name=sev,
+                                marker=dict(size=6, color=col, symbol='diamond'),
+                                text=anom['anomaly_explanation'],
+                                hovertemplate="%{x|%Y-%m-%d}<br>Value: %{y:.2f}<br>%{text}<extra></extra>",
+                            ))
                     q_lower = df['y'].quantile(0.1)
                     q_upper = df['y'].quantile(0.9)
                     fig.add_hline(y=q_lower, line_dash="dash", line_color="green", opacity=0.4)
@@ -1888,7 +2037,15 @@ with tabs[2]:
                         fig.add_trace(go.Scatter(x=forecast['ds'], y=forecast['yhat_lower'], mode='lines', line=dict(width=0), fillcolor='rgba(0,200,0,0.15)', fill='tonexty', name='CI'))
                         anom = df[df['is_anom']]
                         if len(anom) > 0:
-                            fig.add_trace(go.Scatter(x=anom['ds'], y=anom['y'], mode='markers', name='Flagged', marker=dict(size=5, color='red', symbol='x')))
+                            fig.add_trace(go.Scatter(
+                                x=anom['ds'],
+                                y=anom['y'],
+                                mode='markers',
+                                name='Flagged',
+                                marker=dict(size=5, color='red', symbol='x'),
+                                text=anom['anomaly_explanation'],
+                                hovertemplate="%{x|%Y-%m-%d}<br>Value: %{y:.2f}<br>%{text}<extra></extra>",
+                            ))
                         fig.update_layout(
                             title="Forecast with Anomaly Bands",
                             xaxis_title="Date",
@@ -1904,14 +2061,10 @@ with tabs[2]:
                 # For steps data, always show precomputed forecasts with and without holidays
                 if "step" in metric_name.lower():
                     st.markdown("#### 📈 Steps Forecast: With vs Without Holidays")
-                    # Use the same effective date window as anomaly detection,
-                    # if one was set from the Analysis tab; otherwise fall back
-                    # to the full available range from module outputs.
-                    cfg_start = config.get('start_date') if isinstance(config, dict) else None
-                    cfg_end = config.get('end_date') if isinstance(config, dict) else None
                     render_steps_forecast_section(
-                        start_date=cfg_start,
-                        end_date=cfg_end,
+                        steps_df=df[['ds', 'y']],
+                        anom_mask=df['is_anom'],
+                        anom_text=df.get('anomaly_explanation'),
                         show_anomalies=True,
                         show_events=True,
                     )
@@ -1930,6 +2083,9 @@ with tabs[2]:
 # ===== COMPREHENSIVE REPORTS TAB =====
 with tabs[3]:
     st.subheader("Comprehensive Health Report Generator")
+
+    # Simple human-friendly summary for the Reports tab
+    st.caption("Use this page to generate a clear health summary report that explains your recent patterns and anomalies in plain language.")
     
     # File Upload Section
     col1, col2 = st.columns([2, 1])
