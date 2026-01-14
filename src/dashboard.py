@@ -10,7 +10,7 @@ from fpdf import FPDF
 from prophet import Prophet
 
 st.set_page_config(
-    page_title="FitPlus Health Insights Dashboard",
+    page_title="FitPulse Health Insights",
     page_icon="💪",
     layout="wide"
 )
@@ -21,7 +21,7 @@ st.set_page_config(
 st.markdown(
     """
     <div style="display:flex; align-items:center; gap:0.75rem; margin:0; padding:0;">
-        <h1 style="margin:0; padding:0;">FitPlus Health Insights Dashboard</h1>
+        <h1 style="margin:0; padding:0;">FitPulse Health Insights</h1>
         <div style="display:flex; align-items:center; justify-content:center;">
             <svg viewBox="0 0 64 64" width="60" height="60" xmlns="http://www.w3.org/2000/svg">
                 <polyline points="4,34 16,34 22,22 30,44 38,18 46,34 60,34" 
